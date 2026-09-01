@@ -68,6 +68,9 @@ export function VoiceButton({ onTranscript, disabled, onError }: VoiceButtonProp
 
   const begin = useCallback(async () => {
     if (phase !== 'idle' || disabled || !supported) return;
+    // Before the mic even opens: the model load and the recording then run
+    // concurrently instead of one after the other.
+    api.warmTranscriber();
     try {
       handle.current = await startRecording();
       setPhase('recording');

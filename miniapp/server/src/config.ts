@@ -515,11 +515,31 @@ export function loadConfig(): MiniappConfig {
     execTimeoutMs: Number(raw.exec_timeout_seconds || 1200) * 1000,
     port,
     secretPath,
+    /*
+     * `small` quantised to q5_0, not `large-v3-turbo`.
+     *
+     * Measured on this M1 against two dictated clips, both decoded by a
+     * warm resident server so only the model differs:
+     *
+     *                 5.0s clip   9.7s clip
+     *   turbo-q5        2191ms      2248ms
+     *   small-q5         532ms       648ms
+     *
+     * Four times faster -- and MORE accurate on the harder sample, not
+     * less. Turbo returned "AP Physiccy" and "Buried at ASU" where small
+     * returned "AP Physics C" and "Krishnamurthy" correctly; turbo's
+     * cut-down decoder is weakest on exactly the proper nouns and acronyms
+     * a dictated message to this app is full of. So this is not a speed
+     * for accuracy trade, it is better on both axes for this workload.
+     *
+     * Still overridable, and the old model is left on disk, so switching
+     * back is one config key.
+     */
     whisperModelPath: expandHome(
       String(
         process.env.MINIAPP_WHISPER_MODEL ||
           raw.whisper_model ||
-          path.join(stateDir, 'models', 'ggml-large-v3-turbo-q5_0.bin'),
+          path.join(stateDir, 'models', 'ggml-small-q5_0.bin'),
       ),
     ),
     whisperLanguage: String(raw.whisper_language || 'en'),
