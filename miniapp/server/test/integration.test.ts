@@ -5,6 +5,7 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import type { FastifyInstance } from 'fastify';
 import WebSocket from 'ws';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -217,6 +218,132 @@ describe('integration smoke', () => {
         (i: any) => i.kind === 'answer' && i.text === 'finished writing',
       ),
     ).toBe(true);
+    ws.close();
+  });
+
+  /**
+   * The reconnect bug, from the server's side.
+   *
+   * A plain `subscribe` takes the CURRENT transcript as the baseline of
+   * what the client already has. That is right when the client has just
+   * loaded the thread over REST, and catastrophically wrong when the
+   * client is reconnecting: everything written while its socket was down
+   * sits on both sides of the diff and can never be sent, so the phone
+   * shows a thread frozen at the moment the connection dropped. The only
+   * way out was to close the app and reopen the chat, which forces a REST
+   * reload -- which is exactly what was reported.
+   *
+   * `full: true` is how a reconnecting client says "assume I have nothing".
+   */
+  it('sends the whole thread unasked when a resubscribe says full', async () => {
+    const ws = new WebSocket(
+      `${base.replace('http', 'ws')}/ws?token=${encodeURIComponent(token)}`,
+    );
+    const feed = collector(ws);
+    await new Promise((resolve) => ws.on('open', resolve));
+    ws.send(
+      JSON.stringify({
+        type: 'subscribe',
+        sessionId: 'fixtureAAAA',
+        full: true,
+      }),
+    );
+    const subscribed = await feed.waitFor((f) => f.type === 'subscribed');
+    // A full resubscribe declares the client empty, so the server must not
+    // claim it already holds anything.
+    expect(subscribed.length).toBe(0);
+
+    // ...and the thread must arrive without the client having to ask, and
+    // without waiting for the next transcript write.
+    const delta = await feed.waitFor((f) => f.type === 'thread_delta');
+    expect(delta.fromIndex).toBe(0);
+    expect(delta.items.length).toBeGreaterThan(0);
+    expect(
+      delta.items.some(
+        (i: any) => i.kind === 'answer' && i.text === 'finished writing',
+      ),
+    ).toBe(true);
+    ws.close();
+  });
+
+  /** The cheap path is unchanged: a first subscribe still trusts the disk. */
+  it('keeps the cheap baseline when a subscribe does not ask for full', async () => {
+    const ws = new WebSocket(
+      `${base.replace('http', 'ws')}/ws?token=${encodeURIComponent(token)}`,
+    );
+    const feed = collector(ws);
+    await new Promise((resolve) => ws.on('open', resolve));
+    ws.send(JSON.stringify({ type: 'subscribe', sessionId: 'fixtureAAAA' }));
+    const subscribed = await feed.waitFor((f) => f.type === 'subscribed');
+    expect(subscribed.length).toBeGreaterThan(0);
+    ws.close();
+  });
+
+  it('pushes daemon model, effort, permission, and run-state changes', async () => {
+    const ws = new WebSocket(
+      `${base.replace('http', 'ws')}/ws?token=${encodeURIComponent(token)}`,
+    );
+    const feed = collector(ws);
+    await new Promise((resolve) => ws.on('open', resolve));
+    ws.send(JSON.stringify({ type: 'subscribe', sessionId: 'fixtureAAAA' }));
+
+    const initial = await feed.waitFor(
+      (f) => f.type === 'session_state' && f.sessionId === 'fixtureAAAA',
+    );
+    expect(initial.model.modelId).toBe('claude-sonnet-5');
+
+    const db = new DatabaseSync(env.stateDbPath);
+    db.prepare(
+      `UPDATE sessions
+          SET model = ?, permission_mode = 'guard', status = 'running', title = ?
+        WHERE id = ?`,
+    ).run(
+      JSON.stringify({
+        provider: 'OCX',
+        modelId: 'gpt-5.6-luna',
+        thinkingLevel: 'max',
+        fastMode: true,
+      }),
+      'Synced from Mac',
+      'fixtureAAAA',
+    );
+    db.close();
+
+    const changed = await feed.waitFor(
+      (f) =>
+        f.type === 'session_state' &&
+        f.model?.modelId === 'gpt-5.6-luna' &&
+        f.busy === true,
+      3_000,
+    );
+    expect(changed).toMatchObject({
+      title: 'Synced from Mac',
+      status: 'running',
+      busy: true,
+      stoppable: false,
+      permissionMode: 'guard',
+      model: {
+        provider: 'OCX',
+        modelId: 'gpt-5.6-luna',
+        effort: 'max',
+      },
+    });
+
+    const reset = new DatabaseSync(env.stateDbPath);
+    reset.prepare(
+      `UPDATE sessions
+          SET model = ?, permission_mode = 'full-access', status = 'idle', title = ?
+        WHERE id = ?`,
+    ).run(
+      JSON.stringify({
+        provider: 'claude-code',
+        modelId: 'claude-sonnet-5',
+        thinkingLevel: 'high',
+      }),
+      'Fixture plan summary',
+      'fixtureAAAA',
+    );
+    reset.close();
     ws.close();
   });
 

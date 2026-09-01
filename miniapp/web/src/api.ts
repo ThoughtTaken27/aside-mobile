@@ -19,6 +19,7 @@ import type {
   ThreadItem,
   ThreadResponse,
   ThreadStats,
+  ThreadModel,
   Todo,
   UploadedFile,
   BrowserHistoryResponse,
@@ -175,6 +176,20 @@ export const api = {
    * and setting a content-type by hand would strip the boundary the server
    * needs to parse the body.
    */
+  /**
+   * Ask the Mac to load the speech model now, while the user is still
+   * talking.
+   *
+   * Cold start is dominated by reading a 488MB model into memory; a
+   * dictation takes seconds. Overlapping the two is what stops the first
+   * take after a restart from being the slow one. Fire and forget by
+   * design -- a failure here only means the decode is as fast as it used
+   * to be.
+   */
+  warmTranscriber: (): void => {
+    void request('/api/transcribe/warm', { method: 'POST' }).catch(() => {});
+  },
+
   transcribe: async (audio: Blob, signal?: AbortSignal): Promise<string> => {
     const form = new FormData();
     // The extension is a hint for ffmpeg's sniffer, nothing more -- it probes
@@ -270,6 +285,15 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(payload),
     }),
+
+  sessionModel: (
+    sessionId: string,
+    payload: { provider: string; modelId: string; effort: string },
+  ) =>
+    request<{ ok: boolean; model: ThreadModel | null; appliesFrom: string }>(
+      `/api/sessions/${encodeURIComponent(sessionId)}/model`,
+      { method: 'POST', body: JSON.stringify(payload) },
+    ),
 
   /**
    * Start a new session that carries on from one stuck on a native
@@ -521,6 +545,22 @@ function artifactPath(
 export type SocketEvent =
   | { type: 'ready' }
   | { type: 'subscribed'; sessionId: string; busy: boolean; queued: number; length: number }
+  | {
+      type: 'session_state';
+      sessionId: string;
+      title: string;
+      status: string;
+      busy: boolean;
+      stoppable: boolean;
+      queued: number;
+      permission: string | null;
+      permissionMode: string | null;
+      finalConfirm: boolean | null;
+      softConfirm: boolean;
+      model: ThreadModel | null;
+      contextWindow: number;
+      suspended: boolean;
+    }
   /** Replace items from `fromIndex` onward; `length` is the new total. */
   | { type: 'thread_delta'; sessionId: string; fromIndex: number; items: ThreadItem[]; length: number }
   /** Token counters and the citation catalog; moves independently of items. */
@@ -554,19 +594,86 @@ export type SocketEvent =
   | { type: 'pong' };
 
 /**
- * Live thread socket with reconnect.
+ * How often the client proves the socket is still carrying traffic.
  *
- * A reconnect resubscribes from scratch, and the server answers a fresh
- * subscribe by treating what is on disk as the baseline. Anything that
- * landed while the socket was down therefore arrives with the next change
- * or, at the latest, on the forced resync at `turn_finished` -- and
- * `resync()` is there for a client that knows it has fallen behind.
+ * The server pings at the protocol level every 30s, but a browser answers
+ * those in the network layer and never tells the page, so a page cannot
+ * tell a quiet connection from a dead one. On a phone that distinction is
+ * the whole ball game: iOS and Android freeze a backgrounded tab's socket
+ * without closing it, so `readyState` stays OPEN, `onclose` never fires,
+ * no reconnect is ever scheduled, and the thread silently stops updating
+ * until the app is force-quit and reopened. This is an APPLICATION-level
+ * ping whose pong the page can actually see.
+ */
+const PING_INTERVAL_MS = 15_000;
+
+/**
+ * How long the socket may go without any inbound frame before it is
+ * declared dead and replaced.
+ *
+ * Generous enough that a slow tailnet hop or a busy Mac does not cause
+ * churn, tight enough that a resumed app recovers in one interval rather
+ * than never.
+ */
+const SILENCE_LIMIT_MS = PING_INTERVAL_MS + 12_000;
+
+/**
+ * On resume, how stale the last inbound frame must be to justify tearing
+ * the socket down rather than trusting it.
+ *
+ * A reconnect over loopback or a tailnet costs a few milliseconds and
+ * guarantees a correct thread; guessing wrong in the other direction costs
+ * a frozen screen. So the bias is deliberately toward reconnecting.
+ */
+const RESUME_STALE_MS = 5_000;
+
+/** Events that mean "the user is looking at this again". */
+const WAKE_EVENTS = ['visibilitychange', 'pageshow', 'focus', 'online'] as const;
+
+/**
+ * Live thread socket with reconnect, liveness detection, and resume.
+ *
+ * Three bugs lived in the previous version, all of which showed up as the
+ * same symptom -- "I have to close the app and reopen the chat to see the
+ * latest progress":
+ *
+ *  1. A RECONNECT NEVER RESYNCED. `onopen` announced the connection before
+ *     it sent `subscribe`, so the hook's reaction to that announcement (a
+ *     `resync` frame) reached the server while it still had no session
+ *     bound and was discarded as a no-op. The `subscribe` that followed
+ *     made the server take the CURRENT on-disk thread as the baseline of
+ *     what the client already had. Everything written while the socket was
+ *     down therefore existed on both sides of a diff that could never
+ *     report it, and the thread stayed frozen at whatever was on screen
+ *     when the connection dropped. Now the subscribe itself carries
+ *     `full`, so a reconnect always re-sends the whole thread, and it is
+ *     sent BEFORE the connection is announced so ordering cannot matter.
+ *
+ *  2. A FROZEN SOCKET WAS NEVER NOTICED. See `PING_INTERVAL_MS`.
+ *
+ *  3. RESUME WAITED OUT THE BACKOFF. Coming back to the app after a long
+ *     drop could sit through up to ten seconds of exponential backoff
+ *     before even trying. Any wake event now resets the backoff and
+ *     reconnects immediately.
  */
 export class TranscriptSocket {
   private ws: WebSocket | null = null;
   private closed = false;
   private retry = 0;
   private timer: number | null = null;
+  private beat: number | null = null;
+  /** When a frame last arrived. The only honest evidence the socket lives. */
+  private lastSeen = 0;
+  /**
+   * False only for the very first connection of this hook instance.
+   *
+   * That first one follows a REST load of the same thread, so the server's
+   * on-disk baseline is genuinely what the client has and re-sending it
+   * would be pure waste. Every later connection is a reconnect and must
+   * assume it missed something.
+   */
+  private resumed = false;
+  private detachWake: (() => void) | null = null;
 
   constructor(
     private readonly sessionId: string,
@@ -576,39 +683,174 @@ export class TranscriptSocket {
 
   connect(): void {
     if (this.closed) return;
+    if (this.timer !== null) {
+      window.clearTimeout(this.timer);
+      this.timer = null;
+    }
+    // A half-open predecessor would otherwise keep firing handlers into a
+    // socket this object no longer considers current.
+    this.discard();
+    this.listenForWake();
+
     const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
     const url = `${scheme}://${location.host}/ws?token=${encodeURIComponent(
       authToken,
     )}`;
-    const ws = new WebSocket(url);
+    let ws: WebSocket;
+    try {
+      ws = new WebSocket(url);
+    } catch {
+      // Constructing a socket can throw outright (a revoked token in the
+      // URL, an origin the browser will not upgrade). Treat it as a failed
+      // connection rather than an unhandled rejection.
+      this.scheduleReconnect();
+      return;
+    }
     this.ws = ws;
 
     ws.onopen = () => {
+      if (this.ws !== ws) return;
       this.retry = 0;
-      this.onOpenState?.(true);
+      this.lastSeen = Date.now();
+      // Sent BEFORE the open is announced: see the class note. `full` asks
+      // the server to treat this client as knowing nothing, which is the
+      // only safe assumption after a gap of unknown length.
       ws.send(
-        JSON.stringify({ type: 'subscribe', sessionId: this.sessionId }),
+        JSON.stringify({
+          type: 'subscribe',
+          sessionId: this.sessionId,
+          full: this.resumed,
+        }),
       );
+      this.resumed = true;
+      this.startHeartbeat();
+      this.onOpenState?.(true);
     };
     ws.onmessage = (event) => {
+      if (this.ws !== ws) return;
+      // Any frame at all is proof of life, including the pong this class
+      // asked for and the ones the hook does not care about.
+      this.lastSeen = Date.now();
+      let parsed: SocketEvent;
       try {
-        this.onEvent(JSON.parse(event.data) as SocketEvent);
+        parsed = JSON.parse(event.data) as SocketEvent;
       } catch {
-        // ignore unparsable frames
+        return; // ignore unparsable frames
       }
+      if (parsed.type === 'pong') return;
+      this.onEvent(parsed);
     };
     ws.onclose = () => {
+      if (this.ws !== ws) return;
+      this.stopHeartbeat();
+      this.ws = null;
       this.onOpenState?.(false);
       this.scheduleReconnect();
     };
-    ws.onerror = () => ws.close();
+    ws.onerror = () => {
+      if (this.ws !== ws) return;
+      ws.close();
+    };
+  }
+
+  /**
+   * Detach and close whatever socket is current without letting its
+   * handlers run. Used when replacing a connection deliberately, where the
+   * `onclose` reconnect would race the one we are about to make.
+   */
+  private discard(): void {
+    const ws = this.ws;
+    this.ws = null;
+    this.stopHeartbeat();
+    if (!ws) return;
+    ws.onopen = null;
+    ws.onmessage = null;
+    ws.onclose = null;
+    ws.onerror = null;
+    try {
+      ws.close();
+    } catch {
+      // Closing an already-closing socket is not an error worth surfacing.
+    }
+  }
+
+  private startHeartbeat(): void {
+    this.stopHeartbeat();
+    this.beat = window.setInterval(() => {
+      if (this.closed) return;
+      const ws = this.ws;
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      if (Date.now() - this.lastSeen > SILENCE_LIMIT_MS) {
+        // Nothing has come back for longer than two ping cycles. The socket
+        // reads as OPEN but is not carrying traffic, which is precisely the
+        // frozen-after-background case. Replace it.
+        this.onOpenState?.(false);
+        this.connect();
+        return;
+      }
+      try {
+        ws.send(JSON.stringify({ type: 'ping' }));
+      } catch {
+        this.onOpenState?.(false);
+        this.connect();
+      }
+    }, PING_INTERVAL_MS);
+  }
+
+  private stopHeartbeat(): void {
+    if (this.beat !== null) window.clearInterval(this.beat);
+    this.beat = null;
+  }
+
+  /**
+   * Reconnect the moment the app is looked at again.
+   *
+   * Registered once and kept for the life of the socket object, because
+   * the interesting case is precisely the one where no socket is currently
+   * open.
+   */
+  private listenForWake(): void {
+    if (this.detachWake || typeof document === 'undefined') return;
+    const onWake = () => {
+      if (this.closed) return;
+      if (document.visibilityState === 'hidden') return;
+      // A resumed app has no reason to serve out a backoff computed from
+      // failures that happened while nobody was watching.
+      this.retry = 0;
+      const ws = this.ws;
+      const stale = Date.now() - this.lastSeen > RESUME_STALE_MS;
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        this.connect();
+        return;
+      }
+      if (stale) {
+        // Cheap to redo, and the only way to be certain the thread on
+        // screen matches the transcript on the Mac.
+        this.onOpenState?.(false);
+        this.connect();
+      }
+    };
+    for (const name of WAKE_EVENTS) {
+      window.addEventListener(name, onWake);
+    }
+    this.detachWake = () => {
+      for (const name of WAKE_EVENTS) {
+        window.removeEventListener(name, onWake);
+      }
+    };
   }
 
   private scheduleReconnect(): void {
     if (this.closed) return;
-    const delay = Math.min(500 * 2 ** this.retry, 10_000);
+    if (this.timer !== null) window.clearTimeout(this.timer);
+    // Capped at 5s rather than 10s: this is a link to a machine on the
+    // owner's own tailnet, so a long backoff buys nothing and is felt.
+    const delay = Math.min(500 * 2 ** this.retry, 5_000);
     this.retry += 1;
-    this.timer = window.setTimeout(() => this.connect(), delay);
+    this.timer = window.setTimeout(() => {
+      this.timer = null;
+      this.connect();
+    }, delay);
   }
 
   /** Ask the server to re-send the whole thread. */
@@ -620,8 +862,10 @@ export class TranscriptSocket {
 
   close(): void {
     this.closed = true;
-    if (this.timer) window.clearTimeout(this.timer);
-    this.ws?.close();
-    this.ws = null;
+    if (this.timer !== null) window.clearTimeout(this.timer);
+    this.timer = null;
+    this.detachWake?.();
+    this.detachWake = null;
+    this.discard();
   }
 }

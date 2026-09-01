@@ -49,6 +49,7 @@ import fs from 'node:fs';
 import type { MiniappConfig } from './config.js';
 import { verifyToken } from './auth.js';
 import { isValidSessionId, sessionMsgFile } from './sessions.js';
+import { transcriptIsLive } from './transcript.js';
 import type {
   TurnRunner,
   InFlightTurn,
@@ -76,6 +77,7 @@ const HEARTBEAT_MS = 30_000;
  * connection.
  */
 const PUSH_THROTTLE_MS = 150;
+const SESSION_STATE_POLL_MS = 500;
 
 /**
  * How long a subscribe will wait for a brand new session's transcript.
@@ -121,11 +123,34 @@ interface Deps {
    * already open on screen. Absent in tests that don't care.
    */
   viewers?: ActiveViewers;
+  /** Fresh daemon-owned metadata for cross-device synchronization. */
+  readSessionState?: (sessionId: string) => Promise<Record<string, unknown>>;
 }
 
 export function attachWebSocket(deps: Deps): WebSocketServer {
   const { app, config, runner, watchers, threads, subagents, jwtSecret, viewers } = deps;
-  const wss = new WebSocketServer({ noServer: true });
+  const wss = new WebSocketServer({
+    noServer: true,
+    /**
+     * Compress frames over ~1KB.
+     *
+     * A reconnect now re-sends the whole thread (see the `full` flag on
+     * subscribe), and a long thread is tens to hundreds of kilobytes of
+     * highly repetitive JSON. Over a phone link that is the difference
+     * between a resume that feels instant and one that visibly loads. The
+     * memory-level and window settings are deliberately modest: `ws` warns
+     * that the default zlib windows are expensive per connection, and this
+     * server tops out at MAX_CLIENTS sockets that are almost always one.
+     */
+    perMessageDeflate: {
+      zlibDeflateOptions: { level: 6, memLevel: 7, windowBits: 13 },
+      zlibInflateOptions: { windowBits: 13 },
+      clientNoContextTakeover: true,
+      serverNoContextTakeover: true,
+      concurrencyLimit: 4,
+      threshold: 1024,
+    },
+  });
 
   // Each connection registers four listeners across these two emitters, so
   // the default ceiling of 10 trips a spurious "possible memory leak"
@@ -169,6 +194,9 @@ export function attachWebSocket(deps: Deps): WebSocketServer {
     let detach: (() => void) | null = null;
     let pushTimer: NodeJS.Timeout | null = null;
     let awaitTimer: NodeJS.Timeout | null = null;
+    let stateTimer: NodeJS.Timeout | null = null;
+    let stateReading = false;
+    let stateSent = '';
     let lastPush = 0;
     /** Subagents whose timeline needs re-sending on the next push. */
     const dirtyChildren = new Set<string>();
@@ -177,6 +205,33 @@ export function attachWebSocket(deps: Deps): WebSocketServer {
 
     const send = (payload: unknown) => {
       if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(payload));
+    };
+
+    const pushSessionState = async () => {
+      if (!deps.readSessionState || !sessionId || stateReading) return;
+      stateReading = true;
+      const requestedId = sessionId;
+      try {
+        const state = await deps.readSessionState(requestedId);
+        if (sessionId !== requestedId) return;
+        const payload = { type: 'session_state', sessionId: requestedId, ...state };
+        const encoded = JSON.stringify(payload);
+        if (encoded !== stateSent) {
+          stateSent = encoded;
+          send(payload);
+        }
+      } catch {
+        // A transient SQLite read failure should recover on the next tick.
+      } finally {
+        stateReading = false;
+      }
+    };
+
+    const startSessionState = () => {
+      if (!deps.readSessionState || stateTimer) return;
+      void pushSessionState();
+      stateTimer = setInterval(() => void pushSessionState(), SESSION_STATE_POLL_MS);
+      stateTimer.unref?.();
     };
 
     /** Dropped the moment the socket authenticates -- see AUTH_DEADLINE_MS. */
@@ -250,7 +305,16 @@ export function attachWebSocket(deps: Deps): WebSocketServer {
     const pushNow = () => {
       if (!sessionId || !msgFile) return;
       lastPush = Date.now();
-      const busy = runner.isBusy(sessionId);
+      /**
+       * Same liveness gap as the REST thread route: `runner.isBusy` only
+       * knows this server's own turns, so a Mac-started turn pushed over
+       * this socket rendered as finished the instant it opened -- correct
+       * items, wrong fold state, and it never flipped back because
+       * nothing here ever re-checked. `transcriptIsLive` reads the
+       * transcript's own tail instead of trusting either process to say
+       * so.
+       */
+      const busy = runner.isBusy(sessionId) || transcriptIsLive(msgFile);
       const children = subagents.snapshot(sessionId, busy);
       let next: ParentView;
       try {
@@ -311,12 +375,14 @@ export function attachWebSocket(deps: Deps): WebSocketServer {
     const onTurnStarted = (turn: InFlightTurn) => {
       if (turn.sessionId && turn.sessionId === sessionId) {
         send({ type: 'turn_started', ...turn });
+        void pushSessionState();
         schedulePush();
       }
     };
     const onTurnFinished = (turn: TurnFinished) => {
       if (turn.sessionId !== sessionId) return;
       send({ type: 'turn_finished', ...turn });
+      void pushSessionState();
       // One guaranteed full resync per turn -- see the header note. The
       // child list is re-read rather than waited out, so a subagent that
       // finished with the turn settles immediately.
@@ -349,6 +415,9 @@ export function attachWebSocket(deps: Deps): WebSocketServer {
       pushTimer = null;
       if (awaitTimer) clearTimeout(awaitTimer);
       awaitTimer = null;
+      if (stateTimer) clearInterval(stateTimer);
+      stateTimer = null;
+      stateSent = '';
       if (sessionId && msgFile) watchers.release(sessionId);
       if (sessionId) viewers?.leave(sessionId);
       sessionId = null;
@@ -371,19 +440,30 @@ export function attachWebSocket(deps: Deps): WebSocketServer {
      * So a missing file is a WAIT, not an error, for as long as the CLI
      * could plausibly still be creating it.
      */
-    const attach = (id: string, file: string) => {
+    const attach = (id: string, file: string, full: boolean) => {
       msgFile = file;
       viewers?.enter(id);
+      /** Same liveness fill-in as `pushNow` -- see its comment. */
+      const live = runner.isBusy(id) || transcriptIsLive(file);
       try {
-        // The client has just loaded the thread over REST, so the baseline
-        // starts at what is on disk now rather than empty -- otherwise
-        // every thread open would re-send the history it already has.
-        baseline = threads.build(
-          id,
-          file,
-          runner.isBusy(id),
-          subagents.snapshot(id),
-        ).items;
+        /**
+         * On a FIRST subscribe the client has just loaded the thread over
+         * REST, so the baseline starts at what is on disk now rather than
+         * empty -- otherwise every thread open would re-send the history
+         * it already has.
+         *
+         * On a RESUBSCRIBE (`full`) that assumption is exactly wrong and
+         * was the bug behind "I have to close the app and reopen the chat":
+         * a client whose socket dropped mid-turn came back, the server took
+         * the now-newer file as the baseline of what that client already
+         * had, and every line written during the gap sat on both sides of a
+         * diff that could never report it. An empty baseline makes the
+         * first push after a reconnect carry the whole thread, which is the
+         * only thing that is true when the gap length is unknown.
+         */
+        baseline = full
+          ? []
+          : threads.build(id, file, live, subagents.snapshot(id)).items;
       } catch {
         baseline = [];
       }
@@ -391,18 +471,32 @@ export function attachWebSocket(deps: Deps): WebSocketServer {
       const watcher = watchers.acquire(id, file);
       const onEntries = () => schedulePush();
       watcher.on('entries', onEntries);
-      detach = () => watcher.off('entries', onEntries);
+      // 'activity' fires on every mtime change even with no complete line
+      // yet -- see watcher.ts. Without this a long single tool call (no
+      // new JSONL line landing for its whole duration) never re-pushed,
+      // so `transcriptIsLive`'s freshly bumped mtime never reached the
+      // client and the spinner could still time out mid-turn.
+      const onActivity = () => schedulePush();
+      watcher.on('activity', onActivity);
+      detach = () => {
+        watcher.off('entries', onEntries);
+        watcher.off('activity', onActivity);
+      };
 
       send({
         type: 'subscribed',
         sessionId: id,
-        busy: runner.isBusy(id),
+        busy: live,
         queued: runner.queuedCount(id),
         length: baseline.length,
       });
+      startSessionState();
+      // A resubscribe must not wait for the next transcript write to hand
+      // the client the thread it just declared itself ignorant of.
+      if (full) schedulePush();
     };
 
-    const subscribe = (nextId: string) => {
+    const subscribe = (nextId: string, full: boolean) => {
       if (!isValidSessionId(nextId)) {
         send({ type: 'error', reason: 'bad_session_id' });
         return;
@@ -412,7 +506,7 @@ export function attachWebSocket(deps: Deps): WebSocketServer {
 
       const file = sessionMsgFile(config.sessionsDir, nextId);
       if (file && fs.existsSync(file)) {
-        attach(nextId, file);
+        attach(nextId, file, full);
         return;
       }
 
@@ -432,7 +526,7 @@ export function attachWebSocket(deps: Deps): WebSocketServer {
         if (sessionId !== nextId || ws.readyState !== ws.OPEN) return;
         const found = sessionMsgFile(config.sessionsDir, nextId);
         if (found && fs.existsSync(found)) {
-          attach(nextId, found);
+          attach(nextId, found, full);
           return;
         }
         // The turn ending without a transcript means it failed outright.
@@ -469,7 +563,10 @@ export function attachWebSocket(deps: Deps): WebSocketServer {
         return;
       }
       if (msg?.type === 'subscribe') {
-        subscribe(String(msg.sessionId || ''));
+        // `full` is how a reconnecting client says "assume I have nothing".
+        // Absent (an older client, or a first subscribe) keeps the cheap
+        // disk-baseline behavior.
+        subscribe(String(msg.sessionId || ''), msg.full === true);
         return;
       }
       if (msg?.type === 'unsubscribe') {

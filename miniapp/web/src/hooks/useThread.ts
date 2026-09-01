@@ -22,6 +22,10 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { TranscriptSocket, api } from '../api';
 import { threadErrorText } from '../utils/format';
 import { haptic } from '../telegram';
+import {
+  applySessionState,
+  type SessionStateEvent,
+} from '../utils/sessionState';
 import type {
   Attachment,
   ChildSession,
@@ -49,6 +53,7 @@ export interface ThreadState {
   items: ThreadItem[];
   title: string;
   busy: boolean;
+  stoppable: boolean;
   queued: number;
   /** Null means "not known" -- the caller must hide, not guess. */
   permission: string | null;
@@ -130,6 +135,26 @@ export function applyDelta(
   return next.length > delta.length ? next.slice(0, delta.length) : next;
 }
 
+/**
+ * True when a delta cannot be applied to what the client actually holds.
+ *
+ * `applyDelta` splices at `fromIndex`, which is only meaningful if the
+ * client's list is at least that long. When it is shorter there is a hole
+ * between the end of what is on screen and the start of what arrived, and
+ * splicing anyway silently welds the two together -- the visible result is
+ * a step appearing twice, or in the wrong place, or a card from the middle
+ * of the turn stacked on top of the newest one. That is the class of UI
+ * glitch that showed up after a dropped connection, and it is unfixable
+ * from the delta alone: the missing items simply are not in it. The only
+ * correct response is to ask for the thread again.
+ */
+export function deltaHasGap(
+  prev: ThreadItem[],
+  delta: { fromIndex: number },
+): boolean {
+  return delta.fromIndex > prev.length;
+}
+
 /** True once the transcript carries the message the echo was standing in for. */
 export function pendingIsEchoed(
   items: ThreadItem[],
@@ -186,15 +211,44 @@ export function useThread(sessionId: string): ThreadState {
    * and the REST value stands.
    */
   const [liveBusy, setLiveBusy] = useState<boolean | null>(null);
+  const [liveStoppable, setLiveStoppable] = useState<boolean | null>(null);
 
   const alive = useRef(true);
   const socket = useRef<TranscriptSocket | null>(null);
+  const latestSessionState = useRef<SessionStateEvent | null>(null);
+  /**
+   * A mirror of `items` that is readable synchronously.
+   *
+   * Needed because deciding whether a delta is applicable is a side effect
+   * (it may ask for a resync), and side effects do not belong inside a
+   * state updater.
+   */
+  const itemsRef = useRef<ThreadItem[]>([]);
+  /** Rate limit on gap-triggered resyncs, so a bad delta cannot loop. */
+  const lastResync = useRef(0);
+  /**
+   * False until the socket has been open once for this session.
+   *
+   * Distinguishes the opening connection (whose REST load has just run)
+   * from a reconnect (which must refetch the metadata it may have missed).
+   */
+  const connectedOnce = useRef(false);
+
+  const putItems = useCallback((next: ThreadItem[]) => {
+    itemsRef.current = next;
+    setItems(next);
+  }, []);
 
   const load = useCallback(async () => {
     try {
       const next = await api.thread(sessionId);
       if (!alive.current) return;
-      setMeta(next);
+      setMeta(
+        latestSessionState.current
+          ? applySessionState(next, latestSessionState.current)
+          : next,
+      );
+      itemsRef.current = next.items;
       setItems(next.items);
       setStats(next.stats);
       setSources(next.sources);
@@ -213,6 +267,9 @@ export function useThread(sessionId: string): ThreadState {
     alive.current = true;
     setLoading(true);
     setAlerts([]);
+    itemsRef.current = [];
+    lastResync.current = 0;
+    connectedOnce.current = false;
     setItems([]);
     setStats(NO_STATS);
     setSources({});
@@ -221,6 +278,8 @@ export function useThread(sessionId: string): ThreadState {
     setStreamText('');
     setPending(null);
     setLiveBusy(null);
+    setLiveStoppable(null);
+    latestSessionState.current = null;
     setStopping(false);
     void load();
 
@@ -228,7 +287,17 @@ export function useThread(sessionId: string): ThreadState {
       sessionId,
       (event) => {
         if (event.type === 'thread_delta') {
-          setItems((prev) => applyDelta(prev, event));
+          if (deltaHasGap(itemsRef.current, event)) {
+            // Do not paint a thread that is known to be wrong. Ask for the
+            // whole thing instead; at worst this costs one extra frame.
+            const now = Date.now();
+            if (now - lastResync.current > 2_000) {
+              lastResync.current = now;
+              socket.current?.resync();
+            }
+            return;
+          }
+          putItems(applyDelta(itemsRef.current, event));
           // The transcript now carries whatever was being streamed, so the
           // provisional buffer has served its purpose.
           setStreamText('');
@@ -254,6 +323,13 @@ export function useThread(sessionId: string): ThreadState {
         }
         if (event.type === 'subscribed') {
           setLiveBusy(event.busy);
+          return;
+        }
+        if (event.type === 'session_state') {
+          latestSessionState.current = event;
+          setLiveBusy(event.busy);
+          setLiveStoppable(event.stoppable);
+          setMeta((prev) => (prev ? applySessionState(prev, event) : prev));
           return;
         }
         if (event.type === 'turn_started') {
@@ -286,9 +362,14 @@ export function useThread(sessionId: string): ThreadState {
       },
       (isConnected) => {
         setConnected(isConnected);
-        // A socket that just came back may have missed writes; the server
-        // answers `resync` with the whole thread.
-        if (isConnected) socket.current?.resync();
+        // The socket's own `subscribe` now carries `full` on every
+        // reconnect, so the thread itself resyncs without being asked.
+        // What it does NOT carry is the metadata that only the REST payload
+        // has -- title, permission, model, the suspended flag the composer
+        // keys off -- so that is refetched here instead. Skipped on the
+        // first connect, where the REST load has just run anyway.
+        if (isConnected && connectedOnce.current) void load();
+        if (isConnected) connectedOnce.current = true;
       },
     );
     socket.current = ws;
@@ -340,6 +421,7 @@ export function useThread(sessionId: string): ThreadState {
     items: visible,
     title: meta?.title ?? '',
     busy: liveBusy ?? meta?.busy ?? false,
+    stoppable: liveStoppable ?? meta?.stoppable ?? false,
     queued: meta?.queued ?? 0,
     permission: meta?.permission ?? null,
     permissionMode: meta?.permissionMode ?? null,
