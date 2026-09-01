@@ -40,6 +40,8 @@ import { useThread } from './hooks/useThread';
 import { useAttachments } from './hooks/useAttachments';
 import { useDockHeight } from './hooks/useDockHeight';
 import { resolvePills } from './utils/pills';
+import { startVisiblePolling } from './utils/polling';
+import { resolveThreadModel } from './utils/sessionState';
 import { readLocal, writeLocal } from './utils/storage';
 import {
   applyTheme,
@@ -243,6 +245,28 @@ export default function App() {
   const homeDock = useRef<HTMLElement>(null);
   useDockHeight(homeShell, homeDock);
 
+  /**
+   * Same scrim rule as the thread: no haze when there is nothing under the
+   * dock. The recents list is long enough to scroll, so the home screen
+   * had the identical "permanent frosted bar" problem at its end.
+   */
+  const updateHomeScrim = useCallback(() => {
+    const el = homeScroll.current;
+    const dock = homeDock.current;
+    if (!el || !dock) return;
+    const remaining = el.scrollHeight - el.scrollTop - el.clientHeight;
+    dock.dataset.atEnd = remaining <= 2 ? 'true' : 'false';
+  }, []);
+
+  useEffect(() => {
+    updateHomeScrim();
+    if (typeof ResizeObserver === 'undefined') return undefined;
+    const observer = new ResizeObserver(updateHomeScrim);
+    if (homeScroll.current) observer.observe(homeScroll.current);
+    if (homeDock.current) observer.observe(homeDock.current);
+    return () => observer.disconnect();
+  }, [updateHomeScrim, sessions]);
+
   const scrollToHistory = useCallback(() => {
     haptic('light');
     historyRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -429,8 +453,7 @@ export default function App() {
   // browser without a manual pull.
   useEffect(() => {
     if (auth.phase !== 'ready' || screen) return;
-    const timer = window.setInterval(loadSessions, 8000);
-    return () => window.clearInterval(timer);
+    return startVisiblePolling(loadSessions, 8_000);
   }, [auth.phase, screen, loadSessions]);
 
   const openThread = useCallback(
@@ -626,6 +649,8 @@ export default function App() {
     softConfirm?: boolean;
     onPickMode: (id: string) => void;
     onToggleConfirm: (next: boolean) => void;
+    onPickModel: (provider: string, modelId: string) => void;
+    onPickEffort: (id: string) => void;
   }) =>
     picker.kind === 'model' && status ? (
       <ModelSheet
@@ -634,8 +659,8 @@ export default function App() {
         currentModel={current.modelId}
         effortOptions={status.effortMenu}
         currentEffort={current.effortId}
-        onPickModel={pickModel}
-        onPickEffort={pickEffort}
+        onPickModel={current.onPickModel}
+        onPickEffort={current.onPickEffort}
         onClose={closePicker}
         onOpenSettings={() => {
           closePicker();
@@ -685,7 +710,7 @@ export default function App() {
           of reach and the history genuinely scrolls up from underneath it,
           which is the whole point of the layout.
         */}
-        <main className="home-scroll" ref={homeScroll}>
+        <main className="home-scroll" ref={homeScroll} onScroll={updateHomeScrim}>
           <section className="home-rest">
             {/*
               Browser, not Settings.
@@ -784,6 +809,8 @@ export default function App() {
             setNewFinalConfirm(next);
             haptic('light');
           },
+          onPickModel: pickModel,
+          onPickEffort: pickEffort,
         })}
         {homeTabsOpen ? (
           <TabDeck onClose={() => setHomeTabsOpen(false)} />
@@ -806,11 +833,6 @@ export default function App() {
         openThread({ id });
       }}
       pills={pills}
-      // Whether the user has actively chosen; when they have not, the
-      // thread shows the session's own model rather than the account
-      // default, which is a different thing.
-      hasModelOverride={Boolean(modelId)}
-      hasEffortOverride={Boolean(effort)}
       draft={draft}
       setDraft={setDraft}
       attachments={attachments}
@@ -828,8 +850,6 @@ function ThreadScreen({
   onInspectSubagent,
   onOpenRecovered,
   pills,
-  hasModelOverride,
-  hasEffortOverride,
   draft,
   setDraft,
   attachments,
@@ -852,8 +872,6 @@ function ThreadScreen({
     effortLabel: string;
     effortId: string;
   };
-  hasModelOverride: boolean;
-  hasEffortOverride: boolean;
   draft: string;
   setDraft: (value: string) => void;
   attachments: ReturnType<typeof useAttachments>;
@@ -868,6 +886,8 @@ function ThreadScreen({
     softConfirm?: boolean;
     onPickMode: (id: string) => void;
     onToggleConfirm: (next: boolean) => void;
+    onPickModel: (provider: string, modelId: string) => void;
+    onPickEffort: (id: string) => void;
   }) => React.ReactNode;
 }) {
   const thread = useThread(sessionId);
@@ -880,6 +900,11 @@ function ThreadScreen({
   const [tabDeckOpen, setTabDeckOpen] = useState(false);
   const [citation, setCitation] = useState<CitationMark | null>(null);
   const [recovering, setRecovering] = useState(false);
+  const [optimisticModel, setOptimisticModel] = useState(thread.model);
+
+  useEffect(() => {
+    setOptimisticModel(thread.model);
+  }, [thread.model]);
 
   // A stray swipe-to-close should not be able to drop a running turn.
   // Cleared unconditionally on unmount so leaving the thread never leaves
@@ -890,45 +915,86 @@ function ThreadScreen({
     return () => disableClosingConfirmation();
   }, [thread.busy]);
 
-  /**
-   * What this thread is actually running.
-   *
-   * Precedence: an explicit choice by the user, else the model the daemon
-   * has pinned to this session, else the account default. The middle case
-   * is the one that was missing -- the bar used to show the account
-   * default on every session regardless of what it was really using.
-   */
-  const effective = {
-    provider: hasModelOverride
-      ? pills.provider
-      : thread.model?.provider || pills.provider,
-    modelId: hasModelOverride
-      ? pills.modelId
-      : thread.model?.modelId || pills.modelId,
-    modelLabel: hasModelOverride
-      ? pills.modelLabel
-      : thread.model?.label || pills.modelLabel,
-    effortId: hasEffortOverride
-      ? pills.effortId
-      : thread.model?.effort || pills.effortId,
-    effortLabel: hasEffortOverride
-      ? pills.effortLabel
-      : thread.model?.effortLabel || pills.effortLabel,
+  const effective = resolveThreadModel(optimisticModel, pills);
+
+  const updateSessionModel = async (next: {
+    provider: string;
+    modelId: string;
+    effort: string;
+    label?: string;
+  }) => {
+    const previous = optimisticModel;
+    setOptimisticModel({
+      provider: next.provider,
+      modelId: next.modelId,
+      label: next.label || next.modelId,
+      effort: next.effort,
+      effortLabel: next.effort,
+    });
+    try {
+      const result = await api.sessionModel(sessionId, next);
+      setOptimisticModel(result.model);
+    } catch (err) {
+      setOptimisticModel(previous);
+      throw err;
+    }
   };
+
+  /**
+   * Tell the composer's scrim whether anything is still below the fold.
+   *
+   * The haze exists to dissolve text sliding under the composer. At the
+   * very end of a thread there is no such text -- it is blurring blank
+   * page, which is what made it read as a permanent frosted bar rather
+   * than an effect. So the scrim is switched off there and fades back in
+   * the moment there is something under it again.
+   *
+   * Written as a DOM attribute rather than React state on purpose: this
+   * runs on every scroll event, and a re-render of the whole thread per
+   * frame is exactly the kind of thing that makes scrolling feel cheap.
+   */
+  const updateScrim = useCallback(() => {
+    const el = scroller.current;
+    const dock = threadDock.current;
+    if (!el || !dock) return;
+    // 2px, not 0: fractional scroll heights are normal once the content has
+    // images and safe-area padding in it, and a half-pixel of slack must
+    // not count as "there is more to read".
+    const remaining = el.scrollHeight - el.scrollTop - el.clientHeight;
+    dock.dataset.atEnd = remaining <= 2 ? 'true' : 'false';
+  }, []);
 
   // Stay pinned to the newest content while a turn streams, but never yank
   // the view away from someone who has scrolled up to read.
   const pinned = useRef(true);
   useEffect(() => {
     const el = scroller.current;
-    if (!el || !pinned.current) return;
-    el.scrollTop = el.scrollHeight;
-  }, [thread.items]);
+    if (el && pinned.current) el.scrollTop = el.scrollHeight;
+    // After the scroll, not before: the answer that just arrived may be the
+    // reason there is now something below the fold, or the reason there
+    // isn't.
+    updateScrim();
+  }, [thread.items, updateScrim]);
+
+  /*
+   * The dock's own height changes as the draft grows and as the task list
+   * appears, and either can turn "at the end" into "not at the end" without
+   * a scroll event ever firing.
+   */
+  useEffect(() => {
+    updateScrim();
+    if (typeof ResizeObserver === 'undefined') return undefined;
+    const observer = new ResizeObserver(updateScrim);
+    if (scroller.current) observer.observe(scroller.current);
+    if (threadDock.current) observer.observe(threadDock.current);
+    return () => observer.disconnect();
+  }, [updateScrim]);
 
   const onScroll = () => {
     const el = scroller.current;
     if (!el) return;
     pinned.current = el.scrollHeight - el.scrollTop - el.clientHeight < 120;
+    updateScrim();
   };
 
   const send = async () => {
@@ -1163,8 +1229,11 @@ function ThreadScreen({
           busy={sending}
           disabled={sending}
           streaming={thread.busy}
-          onStop={() => void thread.stop()}
+          onStop={thread.stoppable ? () => void thread.stop() : undefined}
           stopping={thread.stopping}
+          stopBlocked={
+            'This turn was started in Aside on your Mac, so only the Mac can stop it.'
+          }
           context={{
             used: thread.stats.totalTokens,
             window: thread.contextWindow,
@@ -1227,6 +1296,19 @@ function ThreadScreen({
         softConfirm: thread.softConfirm,
         onPickMode: (id) => void setPermission({ mode: id }),
         onToggleConfirm: (next) => void setPermission({ finalConfirm: next }),
+        onPickModel: (provider, modelId) =>
+          void updateSessionModel({
+            provider,
+            modelId,
+            effort: effective.effortId,
+          }),
+        onPickEffort: (effort) =>
+          void updateSessionModel({
+            provider: effective.provider,
+            modelId: effective.modelId,
+            effort,
+            label: effective.modelLabel,
+          }),
       })}
     </div>
   );

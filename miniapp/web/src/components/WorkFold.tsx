@@ -27,6 +27,7 @@ import { FileCard } from './FileCard';
 import { SubagentCard } from './SubagentCard';
 import { haptic } from '../telegram';
 import type { CitationMark } from '../utils/citations';
+import { openImage } from './ImageLightbox';
 
 const OUTPUT_CLAMP = 600;
 
@@ -175,7 +176,15 @@ function StepRow({ step }: { step: WorkStep }) {
       {step.images.length || step.imagesDropped ? (
         <div className="step-shots">
           {step.images.map((src, index) => (
-            <img key={index} src={src} alt="" loading="lazy" />
+            <button
+              key={index}
+              type="button"
+              className="md-image-button"
+              aria-label="View image"
+              onClick={() => openImage({ src })}
+            >
+              <img src={src} alt="" loading="lazy" draggable={false} />
+            </button>
           ))}
           {/* The server caps inline images; saying so beats quietly showing
               fewer than the tool produced. */}

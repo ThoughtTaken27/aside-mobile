@@ -19,10 +19,16 @@
   color-scheme: light;
 
   /* --- type ---------------------------------------------------------- */
-  --font-sans: 'Geist Variable', 'Geist', -apple-system, BlinkMacSystemFont,
-    sans-serif;
-  --font-mono: 'Berkeley Mono', 'Geist Mono Variable', 'Geist Mono',
-    ui-monospace, SFMono-Regular, Menlo, monospace;
+  --font-sans: 'Geist Variable', 'Geist', 'Inter', -apple-system,
+    BlinkMacSystemFont, sans-serif;
+  /*
+   * Geist Mono leads now. It is the face we actually bundle, so it is the
+   * one that renders on every phone; Berkeley Mono stays in the ladder for
+   * the desktop-class machines that have it licensed, but it no longer
+   * decides what the app looks like by default.
+   */
+  --font-mono: 'Geist Mono Variable', 'Geist Mono', ui-monospace,
+    SFMono-Regular, 'Berkeley Mono', Menlo, monospace;
   --font-display: 'Aside Display', 'Geist Variable', 'Geist', sans-serif;
   /*
    * The one serif in the app, used for the home greeting and nothing else.
@@ -139,9 +145,13 @@
 
   /* --- light theme ---------------------------------------------------- */
   /*
-   * Sampled from Claude's own app, not guessed: the page is `#f9f9f7` and
-   * cards are pure `#ffffff`. That gap is small -- about 2.5% lightness --
-   * and it is deliberately small. A heavier tint turns the page into a
+   * The palette has one source: the Codex "absolutely" theme. Three values
+   * come from it directly -- paper `#f9f9f7`, ink `#2d2d2b`, accent
+   * `#cc7d5e` -- and everything else on this screen is derived from those
+   * rather than typed, so there is exactly one place to change a hue.
+   *
+   * Cards stay pure `#ffffff`. The gap to the page is small, about 2%
+   * lightness, and deliberately so: a heavier tint turns the page into a
    * coloured background that cards sit ON TOP of; this reads as one paper
    * surface with slightly brighter cards raised out of it, which is the
    * whole basis of the look.
@@ -149,8 +159,15 @@
    * Matched to `--page` so the thread and the home screen are one surface
    * rather than two subtly different whites meeting at a header border.
    */
-  --background: oklch(97.9% 0.0022 106);
-  --foreground: oklch(18% 0.005 75);
+  /* #f9f9f7 */
+  --background: oklch(98.16% 0.0026 106);
+  /*
+   * #2d2d2b. Softer than the near-black this used to be, which is the
+   * theme's own contrast setting made literal: body text lands around
+   * 12:1 on paper rather than 17:1. Still far past WCAG AA, and it is
+   * what keeps a warm off-white page from reading as harsh.
+   */
+  --foreground: oklch(29.6% 0.0036 106);
   /* Menus stay pure white so they read as floating above the page. */
   --popover: var(--color-white);
   --popover-foreground: var(--foreground);
@@ -164,58 +181,91 @@
    * most common way a warm palette gets undone. 0.012 chroma is below the
    * threshold where a surface reads as tinted and above the one where it
    * reads as a different family from the page.
+   *
+   * Their lightness stays at 18% rather than following `--foreground` up
+   * to 29.6%. These are washes, not text: raising the base lightness of a
+   * 5%-alpha overlay makes it disappear rather than making it softer.
    */
-  --primary: oklch(18% 0.006 70 / 0.96);
-  --primary-foreground: oklch(98.5% 0.002 106 / 0.96);
-  --secondary: oklch(18% 0.012 70 / 0.08);
-  --secondary-foreground: oklch(18% 0.008 70 / 0.58);
-  --muted: oklch(18% 0.012 70 / 0.052);
-  --muted-foreground: oklch(18% 0.008 70 / 0.56);
-  --accent: oklch(18% 0.012 70 / 0.1);
-  --accent-foreground: oklch(18% 0.006 70 / 0.86);
+  --primary: oklch(24% 0.005 100 / 0.96);
+  --primary-foreground: oklch(98.5% 0.0026 106 / 0.96);
+  --secondary: oklch(18% 0.01 100 / 0.08);
+  --secondary-foreground: oklch(18% 0.007 100 / 0.62);
+  --muted: oklch(18% 0.01 100 / 0.052);
+  --muted-foreground: oklch(18% 0.007 100 / 0.6);
+  --accent: oklch(18% 0.01 100 / 0.1);
+  --accent-foreground: oklch(24% 0.005 100 / 0.88);
 
   --destructive: var(--color-red-600);
   --destructive-foreground: var(--color-red-50);
   /*
-   * The one accent, and it is Claude's own `#D97757` -- taken from the
-   * brand SVG rather than eyedropped off a screenshot, which samples the
-   * anti-aliased edge and lands a few percent hot.
+   * The one accent: `#cc7d5e` from the theme. A clay orange, four points
+   * darker and a touch less saturated than the `#D97757` that used to sit
+   * here, which matters because it appears as small text (links, markdown
+   * headings) where the lighter clay sat right on the AA line.
    *
-   * It replaces the sky blue that used to sit here. A blue "brand" colour
-   * in an otherwise warm near-neutral palette is the one thing guaranteed
-   * to look bolted on, and it was only ever used for the unread dot.
+   * Everything warm in the app hangs off this token: the home mark, the
+   * skill colour, the waiting state's hue anchor. One accent, one hue
+   * family.
    */
-  --brand: oklch(65.6% 0.119 40.2);
+  --brand: oklch(66.7% 0.108 42);
+  /*
+   * The same clay, dark enough to be read at 12px.
+   *
+   * `--brand` at its literal value is 3.0:1 on paper -- fine for a filled
+   * button (where the contrast that matters is white on clay), fine for a
+   * 10px dot, and under the 4.5:1 AA floor for the small text it is also
+   * used on: markdown links, headings, the model pill. Rather than darken
+   * the accent itself and lose the theme's actual colour on every fill,
+   * this is the one derived value: identical hue and chroma, lightness
+   * dropped to where body text clears AA. Fills use `--brand`, text uses
+   * this.
+   */
+  --brand-text: oklch(56.5% 0.108 42);
+  /*
+   * Skills read in the accent, per the theme's semantic mapping. It is its
+   * own token rather than a second use of `--brand` so a future theme can
+   * separate the two without hunting through components.
+   */
+  --skill: var(--brand-text);
   --success: var(--color-emerald-500);
   /* The permission label is the one place Aside uses orange. */
   --permission: var(--color-orange-500);
   /* The Final confirm switch, green when on -- as in Aside's popover. */
   --switch-on: oklch(64% 0.16 149);
 
-  --border: oklch(18% 0.01 70 / 0.1);
-  --border-surface: oklch(18% 0.01 70 / 0.09);
-  --border-surface-strong: oklch(18% 0.01 70 / 0.14);
-  --input: oklch(18% 0.01 70 / 0.1);
-  --ring: oklch(18% 0.01 70 / 0.08);
+  /*
+   * Diff colours, straight from the theme's semantic block: `#00c853` and
+   * `#ff5f38`. They are separate from `--success` and `--destructive`
+   * on purpose. Those two mean "this worked" and "this is dangerous", and
+   * they appear on buttons and error cards where a saturated signal-green
+   * would be shouting. A diff gutter is the one place the app WANTS a
+   * literal, unmissable pair.
+   */
+  --diff-added: oklch(72.7% 0.208 148);
+  --diff-removed: oklch(69% 0.202 35);
+  /* Same two hues, darkened for the diffstat's 12px mono digits. */
+  --diff-added-text: oklch(52% 0.208 148);
+  --diff-removed-text: oklch(57.5% 0.202 35);
+
+  --border: oklch(18% 0.008 100 / 0.11);
+  --border-surface: oklch(18% 0.008 100 / 0.1);
+  --border-surface-strong: oklch(18% 0.008 100 / 0.15);
+  --input: oklch(18% 0.008 100 / 0.11);
+  --ring: oklch(18% 0.008 100 / 0.08);
 
   --surface-primary: oklch(100% 0 0);
   --surface-secondary: oklch(100% 0 0 / 0.85);
   --surface-tertiary: oklch(100% 0 0 / 0.55);
-  --surface-primary-foreground: oklch(18% 0.006 70 / 0.86);
-  --surface-secondary-foreground: oklch(18% 0.008 70 / 0.56);
-  --surface-tertiary-foreground: oklch(18% 0.008 70 / 0.36);
+  --surface-primary-foreground: oklch(24% 0.005 100 / 0.88);
+  --surface-secondary-foreground: oklch(18% 0.007 100 / 0.6);
+  --surface-tertiary-foreground: oklch(18% 0.007 100 / 0.4);
 
   /*
-   * The page behind the cards.
-   *
-   * Warmed from a dead-neutral off-white to a low-chroma cream. Aside's
-   * own palette is near-neutral and this stays inside that -- 0.004
-   * chroma is below the threshold where a colour reads as tinted -- but
-   * it is the difference between "unstyled white" and a surface that
-   * white cards sit ON. The composer is `--surface-primary`, still pure
-   * white, so it now lifts off the page instead of dissolving into it.
+   * The page behind the cards: the theme's `surface`, `#f9f9f7`. Kept
+   * identical to `--background` rather than re-derived, so there is no
+   * way for the two to drift apart and meet as a seam under a header.
    */
-  --page: oklch(97.9% 0.0022 106);
+  --page: var(--background);
 
   /*
    * The home mark, now the same clay as `--brand` rather than a second
@@ -252,50 +302,62 @@
   color-scheme: dark;
 
   /*
-   * The same warmth, inverted. Claude's dark mode is a warm near-black,
-   * not a blue-black -- carrying 0.006 chroma at hue 70 through the dark
-   * ramp is what stops it reading as "the cold default dark theme" beside
-   * the cream light one.
+   * The theme ships a light variant only, so dark is an inversion rather
+   * than a transcription: same hue family, same accent, lightness flipped.
+   * The hue is 100 to match the paper above -- carrying a trace of chroma
+   * through the dark ramp is what stops it reading as "the cold default
+   * dark theme" beside the warm light one.
    */
-  --background: oklch(21% 0.005 70);
-  --foreground: oklch(97% 0.002 106);
-  --popover: oklch(26% 0.006 70);
-  --popover-foreground: oklch(97% 0.002 106);
+  --background: oklch(21% 0.004 100);
+  --foreground: oklch(94% 0.0026 106);
+  --popover: oklch(26% 0.005 100);
+  --popover-foreground: var(--foreground);
 
-  --primary: oklch(97% 0.002 106 / 0.9);
-  --primary-foreground: oklch(18% 0.006 70 / 0.9);
-  --secondary: oklch(97% 0.004 90 / 0.08);
-  --secondary-foreground: oklch(97% 0.004 90 / 0.56);
-  --muted: oklch(97% 0.004 90 / 0.1);
-  --muted-foreground: oklch(97% 0.004 90 / 0.56);
-  --accent: oklch(97% 0.004 90 / 0.14);
-  --accent-foreground: oklch(97% 0.004 90 / 0.86);
+  --primary: oklch(94% 0.0026 106 / 0.9);
+  --primary-foreground: oklch(21% 0.004 100 / 0.92);
+  --secondary: oklch(97% 0.004 100 / 0.08);
+  --secondary-foreground: oklch(97% 0.004 100 / 0.58);
+  --muted: oklch(97% 0.004 100 / 0.1);
+  --muted-foreground: oklch(97% 0.004 100 / 0.58);
+  --accent: oklch(97% 0.004 100 / 0.14);
+  --accent-foreground: oklch(97% 0.004 100 / 0.86);
 
   --destructive: var(--color-red-400);
   --destructive-foreground: var(--color-red-50);
   /* Lifted and slightly desaturated: the same clay reads muddy against a
      dark ground at its light-mode lightness. */
-  --brand: oklch(72% 0.115 42);
+  --brand: oklch(74% 0.105 42);
+  /* On a dark ground the accent already clears AA at 7.4:1, so text and
+     fill are the same value here; the token exists so components do not
+     have to know which theme they are in. */
+  --brand-text: var(--brand);
+  --skill: var(--brand-text);
   --success: var(--color-emerald-400);
   --permission: var(--color-orange-400);
   --switch-on: oklch(70% 0.16 149);
 
-  --border: oklch(97% 0.004 90 / 0.1);
-  --border-surface: oklch(97% 0.004 90 / 0.14);
-  --border-surface-strong: oklch(97% 0.004 90 / 0.2);
-  --input: oklch(97% 0.004 90 / 0.1);
-  --ring: oklch(97% 0.004 90 / 0.08);
+  /* Same two theme colours, lifted for a dark ground. */
+  --diff-added: oklch(78% 0.185 148);
+  --diff-removed: oklch(74% 0.175 35);
+  --diff-added-text: var(--diff-added);
+  --diff-removed-text: var(--diff-removed);
+
+  --border: oklch(97% 0.004 100 / 0.1);
+  --border-surface: oklch(97% 0.004 100 / 0.14);
+  --border-surface-strong: oklch(97% 0.004 100 / 0.2);
+  --input: oklch(97% 0.004 100 / 0.1);
+  --ring: oklch(97% 0.004 100 / 0.08);
 
   /* The composer must still lift off the page in dark mode, so this is a
      lighter surface rather than the same value as `--page`. */
-  --surface-primary: oklch(26% 0.006 70);
-  --surface-secondary: oklch(97% 0.004 90 / 0.06);
-  --surface-tertiary: oklch(97% 0.004 90 / 0.04);
-  --surface-primary-foreground: oklch(97% 0.004 90 / 0.86);
-  --surface-secondary-foreground: oklch(97% 0.004 90 / 0.56);
-  --surface-tertiary-foreground: oklch(97% 0.004 90 / 0.34);
+  --surface-primary: oklch(26% 0.005 100);
+  --surface-secondary: oklch(97% 0.004 100 / 0.06);
+  --surface-tertiary: oklch(97% 0.004 100 / 0.04);
+  --surface-primary-foreground: oklch(97% 0.004 100 / 0.86);
+  --surface-secondary-foreground: oklch(97% 0.004 100 / 0.58);
+  --surface-tertiary-foreground: oklch(97% 0.004 100 / 0.36);
 
-  --page: oklch(21% 0.005 70);
+  --page: var(--background);
   --mark-warm: var(--brand);
 
   /* --- state colors (semantic, not literal) ------------------------- */
