@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { AsideSymbol } from './Icons';
 import { formatTokens } from '../utils/format';
+import { workedFor } from '../utils/time';
 
 /**
  * `◈ 15s · ↓ 506 tokens`, under the message area while a turn is running.
@@ -45,12 +46,22 @@ export function StreamFooter({
   }, []);
 
   const from = startedAt && startedAt > 0 ? startedAt : mountedAt;
-  const seconds = Math.max(0, Math.round((now - from) / 1000));
+
+  /*
+   * Minutes and hours, not a raw second count.
+   *
+   * The desktop composer's footer reads `5m 50s`; this read `1825s`, which
+   * is the same number in a form nobody can size up at a glance -- and the
+   * fold header directly above it already said `Worked for 30m 25s`, so
+   * one screen disagreed with itself about how to state a duration. Same
+   * helper as that header now.
+   */
+  const elapsed = workedFor(Math.max(0, now - from));
 
   return (
     <div className="stream-footer">
       <AsideSymbol size={13} />
-      <span>{seconds}s</span>
+      <span>{elapsed}</span>
       <span className="stream-footer-dot">·</span>
       <span>↓ {tokens > 0 ? `${formatTokens(tokens)} tokens` : '—'}</span>
     </div>

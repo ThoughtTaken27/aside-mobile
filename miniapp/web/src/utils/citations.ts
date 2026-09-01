@@ -38,8 +38,42 @@ export interface CitationResult {
   marks: CitationMark[];
 }
 
-const CITATION_RE = /<citation\s+refs="([^"]*)"\s*>([\s\S]*?)<\/citation>/g;
-const QUOTE_RE = /<quote>([\s\S]*?)<\/quote>/g;
+/**
+ * Every shape of citation markup seen in real transcripts, in one pass.
+ *
+ * The alternation matters, and so does the order of the branches:
+ *
+ *  1. A COMPLETE tag: `<citation refs="a,b">body</citation>`.
+ *  2. An ORPHANED OPENING tag with no closer. Several models -- gpt-5.6
+ *     among them, reproduced from a real thread on 2026-09-01 -- append
+ *     the tag AFTER the sentence it supports and never close it. The old
+ *     pattern required a closer, so none of these matched and the reader
+ *     got a screenful of literal `<citation refs="NH9pusvrG-...">` in the
+ *     middle of the prose. That is the "random citation refs that keep
+ *     popping up" bug.
+ *  3. An ORPHANED CLOSING tag, which is the same failure from the other
+ *     end and is simply deleted.
+ *
+ * Complete tags are matched first so a well-formed pair is never split
+ * into an orphaned open plus a stray close. Running all three in a single
+ * `replace` keeps the chip numbering in document order, which a second
+ * pass over the whole string would not.
+ *
+ * Attribute quoting is loose (double, single, or bare) because this is
+ * model output, not a document format anyone validates.
+ */
+const REFS = String.raw`refs\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))`;
+const CITATION_RE = new RegExp(
+  // 1-3: paired refs, 4: paired body
+  `<citation\\s+${REFS}\\s*>([\\s\\S]*?)<\\/citation\\s*>` +
+    // 5-7: orphaned refs, 8: a quote that trails it, which belongs to it
+    `|<citation\\s+${REFS}\\s*>(?:\\s*<quote\\s*>([\\s\\S]*?)<\\/quote\\s*>)?` +
+    `|<\\/citation\\s*>`,
+  'gi',
+);
+const QUOTE_RE = /<quote\s*>([\s\S]*?)<\/quote\s*>/gi;
+/** Quote tags left behind by an unclosed citation, unwrapped not shown. */
+const STRAY_QUOTE_RE = /<\/?quote\s*>/gi;
 
 const SUPERSCRIPTS = ['⁰', '¹', '²', '³', '⁴', '⁵', '⁶', '⁷', '⁸', '⁹'];
 
@@ -73,31 +107,64 @@ export function transformCitations(
 ): CitationResult {
   const marks: CitationMark[] = [];
 
-  const markdown = String(text || '').replace(
-    CITATION_RE,
-    (_match, rawRefs: string, body: string) => {
-      const refs = rawRefs
-        .split(',')
-        .map((ref) => ref.trim())
-        .filter((ref) => ref && isKnown(ref));
+  const markdown = String(text || '')
+    .replace(
+      CITATION_RE,
+      (
+        _match,
+        pairedDouble: string | undefined,
+        pairedSingle: string | undefined,
+        pairedBare: string | undefined,
+        pairedBody: string | undefined,
+        openDouble: string | undefined,
+        openSingle: string | undefined,
+        openBare: string | undefined,
+        openQuote: string | undefined,
+      ) => {
+        const pairedRefs = pairedDouble ?? pairedSingle ?? pairedBare;
+        const openRefs = openDouble ?? openSingle ?? openBare;
+        const rawRefs = pairedRefs ?? openRefs;
 
-      // `<quote>` marks the passage the source actually said; the sheet
-      // shows it, and the prose keeps whatever sat outside it.
-      const quotes: string[] = [];
-      const inline = body
-        .replace(QUOTE_RE, (_q, quoted: string) => {
-          quotes.push(quoted.trim());
-          return '';
-        })
-        .trim();
+        // Branch 3: a closing tag with nothing to close. Nothing to render
+        // and nothing to keep -- it is markup that escaped its own pair.
+        if (rawRefs === undefined) return '';
 
-      if (!refs.length) return inline;
+        // An orphaned opening tag has no body by definition -- the sentence
+        // it supports is already in the prose before it -- but a `<quote>`
+        // written straight after it is still that citation's quote, and it
+        // belongs in the sheet rather than dumped into the paragraph.
+        const body =
+          pairedRefs !== undefined
+            ? (pairedBody ?? '')
+            : openQuote
+              ? `<quote>${openQuote}</quote>`
+              : '';
 
-      marks.push({ index: marks.length + 1, refs, quote: quotes.join(' ') });
-      const chip = `[${superscript(marks.length)}](${citationHref(marks.length)})`;
-      return inline ? `${inline}${chip}` : chip;
-    },
-  );
+        const refs = rawRefs
+          .split(',')
+          .map((ref) => ref.trim())
+          .filter((ref) => ref && isKnown(ref));
+
+        // `<quote>` marks the passage the source actually said; the sheet
+        // shows it, and the prose keeps whatever sat outside it.
+        const quotes: string[] = [];
+        const inline = body
+          .replace(QUOTE_RE, (_q, quoted: string) => {
+            quotes.push(quoted.trim());
+            return '';
+          })
+          .trim();
+
+        if (!refs.length) return inline;
+
+        marks.push({ index: marks.length + 1, refs, quote: quotes.join(' ') });
+        const chip = `[${superscript(marks.length)}](${citationHref(marks.length)})`;
+        return inline ? `${inline}${chip}` : chip;
+      },
+    )
+    // A `<quote>` whose citation never closed would otherwise survive as
+    // literal markup for exactly the same reason the tag above did.
+    .replace(STRAY_QUOTE_RE, '');
 
   return { markdown, marks };
 }
@@ -119,5 +186,11 @@ export function dropPartialCitation(text: string): string {
   }
   // Fewer characters than the tag name, but everything so far matches it --
   // `<cit` is one delta away from being a tag and must not flash on screen.
-  return '<citation'.startsWith(tail) ? text.slice(0, open) : text;
+  // Case-insensitive for the same reason the tag pattern is: this is model
+  // output. Compared against the LONGER of the two prefixes so a partial
+  // `</cit` is caught as well as a partial `<cit`.
+  const lower = tail.toLowerCase();
+  const partial =
+    '<citation'.startsWith(lower) || '</citation'.startsWith(lower);
+  return partial ? text.slice(0, open) : text;
 }

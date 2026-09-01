@@ -31,7 +31,7 @@ import {
 } from './Icons';
 import { ContextRing } from './ContextRing';
 import { VoiceButton } from './VoiceButton';
-import { haptic, showConfirm } from '../telegram';
+import { haptic } from '../telegram';
 import type { ComposerAttachment } from '../types';
 import { pillModelLabel } from '../utils/pills';
 
@@ -64,12 +64,33 @@ export interface ComposerProps {
   busy?: boolean;
   disabled?: boolean;
   /**
-   * A turn is streaming. Shows the stop control to the LEFT of send, as the
-   * desktop composer does.
+   * A turn is running.
+   *
+   * The send button turns INTO the stop control while this is true, which
+   * is what the desktop composer does: one slot, one control, and the
+   * shape of it tells you whether the agent is waiting for you or you are
+   * waiting for it. The previous layout put a second, smaller square to
+   * the left of an unchanged send arrow, so the phone never showed the
+   * black-circle stop the desktop shows and the send arrow stayed lit
+   * during a turn as if a second message were expected.
    */
   streaming?: boolean;
-  /** Kill the running turn. Absent on the home composer, which has none. */
+  /**
+   * Kill the running turn. Absent on the home composer, which has none,
+   * and absent for a turn this server does not own -- see `stopBlocked`.
+   */
   onStop?: () => void;
+  /**
+   * Why the running turn cannot be stopped from here, when it cannot.
+   *
+   * A turn started in Aside on the Mac runs inside the daemon process,
+   * which exposes no cancel to this server (its `sessions.abort` procedure
+   * sits behind a signed handshake only the desktop app's own keychain
+   * identity can complete). The control still appears -- the state IS
+   * "running", and hiding it would make the composer disagree with the
+   * desktop -- but it says why instead of pretending to fire.
+   */
+  stopBlocked?: string | null;
   /** Between tapping Stop and the turn actually ending. */
   stopping?: boolean;
   /**
@@ -256,6 +277,7 @@ export function Composer({
   streaming,
   onStop,
   stopping,
+  stopBlocked,
   blockedReason,
   onRecover,
   recovering,
@@ -268,11 +290,13 @@ export function Composer({
   const fileInput = useRef<HTMLInputElement>(null);
 
   /**
-   * Last voice problem, shown under the input and cleared on the next
-   * successful take. Deliberately not a toast: the thing that went wrong is
-   * about this control, so it belongs next to this control.
+   * The composer's one inline notice line, shown under the input.
+   *
+   * Used by dictation for a failed take and by the stop control when the
+   * running turn belongs to the Mac. Deliberately not a toast: both things
+   * are about a control in this row, so they belong next to that control.
    */
-  const [voiceError, setVoiceError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
 
   // Grow with the content instead of scrolling inside a fixed box, which
   // is what the sidepanel composer does.
@@ -404,9 +428,9 @@ export function Composer({
         spellCheck={mode === 'search' ? false : undefined}
       />
 
-      {voiceError ? (
+      {notice ? (
         <p className="composer-voice-error" role="status">
-          {voiceError}
+          {notice}
         </p>
       ) : null}
 
@@ -486,30 +510,6 @@ export function Composer({
         <span className="composer-spacer" />
 
         {/*
-          Stop sits to the LEFT of send while a turn runs, matching the
-          desktop composer's small black rounded square. It is a real kill:
-          the server SIGTERMs the `aside exec` child it owns, by PID.
-        */}
-        {streaming && onStop ? (
-          <button
-            type="button"
-            className="round-button stop"
-            onClick={() => {
-              haptic('medium');
-              // A real kill: confirm before it happens rather than after,
-              // since there is no undo once the SIGTERM lands.
-              void showConfirm('Stop this turn?').then((ok) => {
-                if (ok) onStop();
-              });
-            }}
-            disabled={stopping}
-            aria-label="Stop"
-          >
-            {stopping ? <Spinner size={14} /> : <StopSquare size={14} />}
-          </button>
-        ) : null}
-
-        {/*
           Dictation sits immediately to the LEFT of send, which is where
           Aside's own desktop composer puts it and where every other app
           that has both controls puts it.
@@ -529,9 +529,9 @@ export function Composer({
         */}
         <VoiceButton
           disabled={blocked}
-          onError={setVoiceError}
+          onError={setNotice}
           onTranscript={(text) => {
-            setVoiceError(null);
+            setNotice(null);
             // Append rather than replace: dictation is one more way to add to
             // the message, so it has to compose with whatever is already typed.
             const base = value.trimEnd();
@@ -540,15 +540,64 @@ export function Composer({
           }}
         />
 
-        <button
-          type="button"
-          className="round-button send"
-          onClick={submit}
-          disabled={!canSend}
-          aria-label="Send"
-        >
-          {busy ? <Spinner size={16} /> : <ArrowUp size={17} strokeWidth={2} />}
-        </button>
+        {/*
+          One slot, two identities.
+
+          Idle: the dark circle with the up arrow. Running: the same dark
+          circle with a white rounded square in it -- the desktop's stop
+          button, in the desktop's position, at the desktop's size. Nothing
+          moves between the two states, so the thumb never has to hunt for
+          the control, and the composer never shows a live send arrow for a
+          turn that is still answering.
+        */}
+        {streaming ? (
+          <button
+            type="button"
+            className="round-button send stop"
+            onClick={() => {
+              if (stopping) return;
+              if (!onStop) {
+                haptic('warning');
+                setNotice(
+                  stopBlocked ??
+                    'This turn is running in Aside on your Mac, so only the Mac can stop it.',
+                );
+                return;
+              }
+              // No confirmation sheet, deliberately. The desktop stops on
+              // one tap, this is meant to match it, and a modal between the
+              // tap and the kill is exactly the lag this control is here to
+              // not have. `stopping` shows immediately so the tap is never
+              // silent.
+              haptic('medium');
+              onStop();
+            }}
+            aria-label="Stop"
+            // Genuinely disabled only while a kill is already in flight. The
+            // Mac-owned case stays clickable on purpose: a dead button that
+            // does nothing is the "just for decoration" failure, and the tap
+            // is what surfaces the explanation.
+            disabled={stopping}
+            aria-disabled={!onStop}
+            data-inert={onStop ? undefined : 'true'}
+          >
+            {stopping ? <Spinner size={16} /> : <StopSquare size={15} />}
+          </button>
+        ) : (
+          <button
+            type="button"
+            className="round-button send"
+            onClick={submit}
+            disabled={!canSend}
+            aria-label="Send"
+          >
+            {busy ? (
+              <Spinner size={16} />
+            ) : (
+              <ArrowUp size={17} strokeWidth={2} />
+            )}
+          </button>
+        )}
       </div>
     </div>
   );
