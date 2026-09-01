@@ -19,7 +19,46 @@ import { TranscriptParser, type TranscriptEntry } from './transcript.js';
  * even when fs.watch is asleep.
  */
 const POLL_MS = 800;
-const NEWLINE = 0x0a;
+
+/**
+ * Incremental newline framing for append-only JSONL.
+ *
+ * Partial records stay in memory until their newline arrives. The watcher
+ * can therefore advance its file cursor after every read instead of reading
+ * the same growing partial record again on every fs event.
+ */
+export class JsonlFramer {
+  private partial: Buffer[] = [];
+
+  push(chunk: Buffer): string[] {
+    const lines: string[] = [];
+    let start = 0;
+    for (let i = 0; i < chunk.length; i += 1) {
+      if (chunk[i] !== 0x0a) continue;
+      const segment = chunk.subarray(start, i);
+      let line: Buffer;
+      if (this.partial.length) {
+        this.partial.push(segment);
+        line = Buffer.concat(this.partial);
+        this.partial = [];
+      } else {
+        line = segment;
+      }
+      lines.push(line.toString('utf8'));
+      start = i + 1;
+    }
+    if (start < chunk.length) {
+      // Copy the tail so a tiny partial line does not retain a much larger
+      // read buffer that also contained many complete records.
+      this.partial.push(Buffer.from(chunk.subarray(start)));
+    }
+    return lines;
+  }
+
+  reset(): void {
+    this.partial = [];
+  }
+}
 
 export class SessionWatcher extends EventEmitter {
   private bytePos = 0;
@@ -28,6 +67,10 @@ export class SessionWatcher extends EventEmitter {
   private timer: NodeJS.Timeout | null = null;
   private fsWatcher: fs.FSWatcher | null = null;
   private started = false;
+  private framer = new JsonlFramer();
+  private fileIdentity = '';
+  /** Last mtime seen, so a partial-line write can still be reported as activity. */
+  private lastMtimeMs = 0;
   refs = 0;
 
   constructor(
@@ -79,12 +122,36 @@ export class SessionWatcher extends EventEmitter {
     if (!stat?.isFile()) return;
     if (!this.fsWatcher) this.attachFsWatch();
 
-    if (stat.size < this.bytePos) {
-      // truncated or replaced: start over rather than emit garbage
+    /**
+     * The file moved even if nothing below finds a complete line to
+     * parse. A single long-running tool call -- a slow bash command
+     * streaming output that has not hit its closing brace yet -- writes
+     * bytes without ever completing the JSONL line those bytes belong
+     * to, so the early return at "only a partial line so far" used to
+     * mean total silence on this watcher for the whole duration of that
+     * call. `transcriptIsLive` reads the file's mtime to decide
+     * liveness, so an 'activity' event with no entries is enough to
+     * make the socket re-push and pick that mtime up -- it does not need
+     * a parsed entry to know the turn is still going.
+     */
+    if (stat.mtimeMs !== this.lastMtimeMs) {
+      this.lastMtimeMs = stat.mtimeMs;
+      if (emit) this.emit('activity');
+    }
+
+    const identity = `${stat.dev}:${stat.ino}`;
+    if (
+      (this.fileIdentity && identity !== this.fileIdentity) ||
+      stat.size < this.bytePos
+    ) {
+      // Truncated or atomically replaced: start over rather than joining a
+      // partial record from the old file to bytes from the new one.
       this.bytePos = 0;
       this.lineNo = 0;
       this.parser = new TranscriptParser();
+      this.framer.reset();
     }
+    this.fileIdentity = identity;
     if (stat.size <= this.bytePos) return;
 
     let chunk: Buffer;
@@ -95,27 +162,21 @@ export class SessionWatcher extends EventEmitter {
       chunk = Buffer.alloc(length);
       const read = fs.readSync(fd, chunk, 0, length, this.bytePos);
       chunk = chunk.subarray(0, read);
+      this.bytePos += read;
     } catch {
       return;
     } finally {
       if (fd !== null) fs.closeSync(fd);
     }
 
-    const lastNewline = chunk.lastIndexOf(NEWLINE);
-    if (lastNewline < 0) return; // only a partial line so far
-
-    const consumed = lastNewline + 1;
-    const text = chunk.subarray(0, consumed).toString('utf8');
-    const lines = text.split('\n');
-    lines.pop(); // trailing "" produced by the final newline
+    const lines = this.framer.push(chunk);
+    if (!lines.length) return;
 
     const entries: TranscriptEntry[] = [];
     for (const line of lines) {
       entries.push(...this.parser.feedLine(line, this.lineNo));
       this.lineNo += 1;
     }
-    this.bytePos += consumed;
-
     if (emit && entries.length) this.emit('entries', entries);
   }
 }

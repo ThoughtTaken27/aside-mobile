@@ -18,6 +18,8 @@
  *    <subagent_result task_id="..."> block per finished subagent.
  */
 
+import fs from 'node:fs';
+
 export type TranscriptEntryKind =
   | 'user'
   | 'assistant_text'
@@ -368,4 +370,232 @@ export function parseTranscript(
     if (line > afterLine) entries.push(...produced);
   });
   return { entries, lastLine: lines.length - 1 };
+}
+
+/**
+ * How stale a transcript's last write may be and still count as live.
+ *
+ * A turn can sit between transcript writes for as long as one tool call
+ * takes -- a slow subagent_wait, a long bash command -- so this is not "how
+ * fast do we notice a stall", it is "how long after the LAST byte landed do
+ * we stop believing the turn is still going". `watcher.ts` now emits on
+ * every mtime change even without a complete new line, which keeps this
+ * fresh for a long-running single tool call too.
+ */
+export const LIVE_TRANSCRIPT_WINDOW_MS = 30_000;
+
+/**
+ * Whether the transcript's tail record is an unfinished turn: an assistant
+ * record whose last part is a `toolCall` with no matching `toolResult`
+ * later in the file, or an assistant record with no terminal `stopReason`.
+ *
+ * This is the fallback liveness signal for a turn a DIFFERENT process
+ * spawned -- most importantly a turn started from the Mac. `runner.isBusy`
+ * only knows about turns this server itself spawned via `aside exec|
+ * child_process, and the daemon's own `state.db` status column never
+ * actually reaches `running` in practice (verified: 1,109 rows, zero
+ * `running`). So a desktop-started turn has no other liveness signal at
+ * all, and without this every phone view of it renders as a collapsed,
+ * finished fold until the user taps in.
+ *
+ * Deliberately reads only the last few tool call / tool result records
+ * rather than parsing the whole file: the question this answers is "is the
+ * LAST thing in the file still open", and a transcript can be tens of
+ * megabytes.
+ */
+export function tailIsUnfinishedTurn(buffer: string): boolean {
+  const lines = completeLines(buffer);
+  // Walk from the end. The only records that matter are the trailing
+  // assistant/toolResult run; a user record ends the search because
+  // anything before the last user turn is necessarily already finished.
+  const openCallIds = new Set<string>();
+  // Walking backward means a toolResult is always encountered BEFORE the
+  // toolCall it answers (results are written after calls). So a call's id
+  // can't simply be deleted-on-result then added-on-call -- the delete
+  // would be a no-op that runs before the id ever exists, leaving every
+  // resolved call looking permanently open. Track resolved ids separately
+  // and only count a toolCall as open if its id was never resolved.
+  const resolvedCallIds = new Set<string>();
+  let sawTrailingAssistant = false;
+  let trailingAssistantHasTerminalStop = false;
+
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    const line = lines[i].trim();
+    if (!line) continue;
+    let msg: Record<string, unknown>;
+    try {
+      msg = JSON.parse(line) as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+    const role = msg.role;
+
+    if (role === 'user') {
+      // Reached the start of the current turn without finding an open
+      // tool call and without an unterminated assistant record: finished.
+      break;
+    }
+
+    if (role === 'toolResult') {
+      const id = typeof msg.toolCallId === 'string' ? msg.toolCallId : '';
+      if (id) resolvedCallIds.add(id);
+      continue;
+    }
+
+    if (role === 'assistant') {
+      if (!sawTrailingAssistant) {
+        sawTrailingAssistant = true;
+        const stopReason = (msg as { stopReason?: unknown }).stopReason;
+        // 'toolUse' is a terminal stop for the ASSISTANT RECORD itself --
+        // the turn continues, but only if the tool call it just emitted
+        // has no matching result yet, which the toolCall scan below
+        // decides. Anything else terminal (stop / error / length /
+        // aborted) closes the record outright.
+        trailingAssistantHasTerminalStop =
+          typeof stopReason === 'string' &&
+          stopReason !== 'toolUse' &&
+          stopReason.length > 0;
+      }
+      const content = Array.isArray(msg.content) ? msg.content : [];
+      for (const part of content) {
+        if (!part || typeof part !== 'object') continue;
+        if ((part as { type?: unknown }).type !== 'toolCall') continue;
+        const id = (part as { id?: unknown }).id;
+        if (typeof id === 'string' && id && !resolvedCallIds.has(id)) {
+          openCallIds.add(id);
+        }
+      }
+      continue;
+    }
+
+    // system-message / user-message-metadata: skip, keep walking back.
+  }
+
+  if (openCallIds.size > 0) return true;
+  if (sawTrailingAssistant && !trailingAssistantHasTerminalStop) return true;
+  return false;
+}
+
+/**
+ * How much of the tail of a transcript is read to decide liveness.
+ *
+ * The question this answers is "is the LAST record in the file still
+ * open", which lives in the last handful of lines -- a few KB, ordinarily.
+ * This is generous headroom for a large tool result sitting just before
+ * the open call (a long bash capture, a big diff), while still being a
+ * bounded read rather than the whole transcript. A transcript can be tens
+ * of megabytes, and this runs on every session row of every list poll for
+ * any session touched in the last `LIVE_TRANSCRIPT_WINDOW_MS`.
+ *
+ * Safe to keep fixed rather than growing on a miss: the transcript is
+ * JSONL, one record per line, so a tail read that starts mid-file can only
+ * ever corrupt the SINGLE leading fragment of its window -- every
+ * complete line after that first newline is intact regardless of where
+ * the read started. `tailIsUnfinishedTurn`'s own try/catch already skips
+ * an unparseable line, so the worst case here is losing visibility into
+ * one oversized record that straddles the window boundary, which is a
+ * false "still live" for a little longer, not a false "finished".
+ */
+const LIVE_TAIL_BYTES = 256 * 1024;
+
+/**
+ * A turn is live when the transcript's tail is unfinished AND the file was
+ * touched recently. Recency alone is not enough -- a finished turn's last
+ * write is also "recent" for the first `LIVE_TRANSCRIPT_WINDOW_MS` after it
+ * ends -- so both conditions have to hold.
+ *
+ * The recency check runs first and is a bare `statSync`: cheap, and it is
+ * what keeps this affordable to call for every row in a session list --
+ * ordinarily zero or one session is within the window at any moment, so
+ * the tail read below almost never actually happens.
+ */
+interface TailCacheEntry {
+  size: number;
+  mtimeMs: number;
+  unfinished: boolean;
+}
+
+/**
+ * Bounded transcript-liveness reader.
+ *
+ * Session lists and sockets can ask about the same active file several
+ * times per second. The file signature still gets checked on every call,
+ * but an unchanged tail is parsed once. Recency is deliberately not cached:
+ * a live-looking tail must still age out when no more bytes arrive.
+ */
+export class TranscriptLiveness {
+  private readonly tails = new Map<string, TailCacheEntry>();
+
+  constructor(private readonly maxEntries = 256) {}
+
+  isLive(
+    msgFile: string,
+    opts: { now?: () => number; windowMs?: number } = {},
+  ): boolean {
+    const now = opts.now ?? Date.now;
+    const windowMs = opts.windowMs ?? LIVE_TRANSCRIPT_WINDOW_MS;
+    let stat: fs.Stats | undefined;
+    try {
+      stat = fs.statSync(msgFile, { throwIfNoEntry: false });
+    } catch {
+      return false;
+    }
+    if (!stat?.isFile()) return false;
+    if (now() - stat.mtimeMs > windowMs) return false;
+
+    const cached = this.tails.get(msgFile);
+    if (cached && cached.size === stat.size && cached.mtimeMs === stat.mtimeMs) {
+      // Refresh insertion order so frequently observed live sessions survive
+      // eviction while old rows fall out naturally.
+      this.tails.delete(msgFile);
+      this.tails.set(msgFile, cached);
+      return cached.unfinished;
+    }
+
+    const buffer = readTail(msgFile, stat.size, LIVE_TAIL_BYTES);
+    if (buffer === null) return false;
+    const unfinished = tailIsUnfinishedTurn(buffer);
+    this.tails.set(msgFile, {
+      size: stat.size,
+      mtimeMs: stat.mtimeMs,
+      unfinished,
+    });
+    this.trim();
+    return unfinished;
+  }
+
+  private trim(): void {
+    while (this.tails.size > this.maxEntries) {
+      const oldest = this.tails.keys().next().value as string | undefined;
+      if (oldest === undefined) return;
+      this.tails.delete(oldest);
+    }
+  }
+}
+
+const sharedLiveness = new TranscriptLiveness();
+
+export function transcriptIsLive(
+  msgFile: string,
+  opts: { now?: () => number; windowMs?: number } = {},
+): boolean {
+  return sharedLiveness.isLive(msgFile, opts);
+}
+
+/** Read up to the last `maxBytes` of a file, as text. */
+function readTail(file: string, size: number, maxBytes: number): string | null {
+  const start = Math.max(0, size - maxBytes);
+  const length = size - start;
+  if (length <= 0) return '';
+  let fd: number | null = null;
+  try {
+    fd = fs.openSync(file, 'r');
+    const chunk = Buffer.alloc(length);
+    const read = fs.readSync(fd, chunk, 0, length, start);
+    return chunk.subarray(0, read).toString('utf8');
+  } catch {
+    return null;
+  } finally {
+    if (fd !== null) fs.closeSync(fd);
+  }
 }

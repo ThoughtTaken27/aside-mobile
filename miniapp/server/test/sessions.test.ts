@@ -1,11 +1,12 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   isValidSessionId,
   listSessions,
   resolveSessionDir,
   scanTranscript,
+  SessionDirectoryIndex,
   sessionMsgFile,
 } from '../src/sessions.js';
 import { makeTestEnv, readFixture, type TestEnv } from './helpers.js';
@@ -98,6 +99,33 @@ describe('session listing', () => {
 });
 
 describe('session resolution', () => {
+  it('scans the sessions directory once for repeated id lookups', () => {
+    const index = new SessionDirectoryIndex();
+    const reads = vi.spyOn(fs, 'readdirSync');
+
+    expect(index.resolve(env.sessionsDir, 'fixtureAAAA')).toContain(
+      '2026-01-02_fixtureAAAA',
+    );
+    expect(index.resolve(env.sessionsDir, 'fixtureBBBB')).toContain(
+      '2026-01-03_fixtureBBBB',
+    );
+    expect(index.resolve(env.sessionsDir, 'nosuchsession')).toBeNull();
+    expect(reads).toHaveBeenCalledTimes(1);
+    reads.mockRestore();
+  });
+
+  it('refreshes its directory map after the cache window', () => {
+    let now = 1_000;
+    const index = new SessionDirectoryIndex(1_000, () => now);
+    expect(index.resolve(env.sessionsDir, 'brandNew')).toBeNull();
+
+    fs.mkdirSync(path.join(env.sessionsDir, '2026-08-24_brandNew'));
+    now += 1_001;
+    expect(index.resolve(env.sessionsDir, 'brandNew')).toContain(
+      '2026-08-24_brandNew',
+    );
+  });
+
   it('resolves the short id to its dated directory', () => {
     const dir = resolveSessionDir(env.sessionsDir, 'fixtureAAAA');
     expect(dir && path.basename(dir)).toBe('2026-01-02_fixtureAAAA');

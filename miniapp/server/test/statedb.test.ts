@@ -122,6 +122,7 @@ describe('parseSessionModel', () => {
       provider: 'claude-code',
       modelId: 'claude-fable-5',
       thinkingLevel: 'high',
+      fastMode: false,
     });
   });
 
@@ -144,6 +145,7 @@ describe('StateDb.read', () => {
   it('reads a full-access session with its pinned model', async () => {
     const db = new StateDb(makeDb(rows), 0);
     expect(await db.read('full-1')).toEqual({
+      title: 'title full-1',
       permission: 'Full access',
       permissionMode: 'full-access',
       finalConfirm: null,
@@ -157,6 +159,7 @@ describe('StateDb.read', () => {
         provider: 'claude-code',
         modelId: 'claude-fable-5',
         thinkingLevel: 'high',
+        fastMode: false,
       },
     });
   });
@@ -172,6 +175,7 @@ describe('StateDb.read', () => {
   it('reports the permission even when no model is pinned', async () => {
     const db = new StateDb(makeDb(rows), 0);
     expect(await db.read('readonly-1')).toEqual({
+      title: 'title readonly-1',
       permission: 'Read only',
       permissionMode: 'read-only',
       finalConfirm: null,
@@ -184,6 +188,7 @@ describe('StateDb.read', () => {
       model: null,
     });
     expect(await db.read('nomodel-1')).toEqual({
+      title: 'title nomodel-1',
       permission: 'Guard',
       permissionMode: 'guard',
       finalConfirm: null,
@@ -237,6 +242,28 @@ describe('StateDb.read', () => {
 
     now += 6000;
     expect((await db.read('a')).permission).toBe('Full access');
+  });
+
+  it('readFresh bypasses the TTL for cross-device state changes', async () => {
+    const file = makeDb([['a', 'guard', model('claude-code', 'first')]]);
+    const state = new StateDb(file, 60_000);
+    expect((await state.read('a')).model?.modelId).toBe('first');
+
+    const raw = new DatabaseSync(file);
+    raw.prepare('UPDATE sessions SET model = ? WHERE id = ?').run(
+      model('OCX', 'gpt-5.6-luna', 'max'),
+      'a',
+    );
+    raw.close();
+
+    expect((await state.read('a')).model?.modelId).toBe('first');
+    expect((await state.readFresh('a')).model).toMatchObject({
+      provider: 'OCX',
+      modelId: 'gpt-5.6-luna',
+      thinkingLevel: 'max',
+      fastMode: false,
+    });
+    expect((await state.read('a')).model?.modelId).toBe('gpt-5.6-luna');
   });
 });
 

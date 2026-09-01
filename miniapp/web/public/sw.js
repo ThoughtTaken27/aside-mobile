@@ -160,7 +160,7 @@ self.addEventListener('fetch', (event) => {
           // dinosaur, because the fix here is "wake the Mac", not "get signal".
           return new Response(
             `<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1">
-             <style>body{font:16px/1.5 -apple-system,system-ui,sans-serif;background:#faf9f6;color:#3d3a34;
+             <style>body{font:16px/1.5 -apple-system,system-ui,sans-serif;background:#f9f9f7;color:#2d2d2b;
              display:flex;min-height:100vh;margin:0;align-items:center;justify-content:center;text-align:center}
              div{max-width:22rem;padding:2rem}p{opacity:.7}</style>
              <div><h1>Can't reach your Mac</h1>

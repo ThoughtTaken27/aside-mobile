@@ -8,7 +8,7 @@
  * is a web page.
  *
  * Rendering these in a browser rather than compositing them with an image
- * library keeps them honest: the background is the same `#faf9f6` the app
+ * library keeps them honest: the background is the same `#f9f9f7` the app
  * paints, so the splash and the first painted frame are the same colour
  * and the handover is invisible.
  *
@@ -46,7 +46,7 @@ const DEVICES = [
 const html = (w, h) => `<!doctype html><meta charset=utf-8>
 <style>
   html,body{margin:0;padding:0;width:${w}px;height:${h}px;overflow:hidden}
-  body{background:#faf9f6;display:flex;align-items:center;justify-content:center}
+  body{background:#f9f9f7;display:flex;align-items:center;justify-content:center}
   /* Icon sized as a fraction of the short edge so it reads the same on
      every device rather than shrinking on the large ones. */
   img{width:${Math.round(Math.min(w, h) * 0.26)}px;height:auto;border-radius:22%}

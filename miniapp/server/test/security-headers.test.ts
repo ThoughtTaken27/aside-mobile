@@ -57,8 +57,10 @@ describe('every response', () => {
     const res = await app.inject({ method: 'GET', url: '/app' });
     const csp = String(res.headers['content-security-policy']);
     expect(csp).toContain("default-src 'self'");
-    // Telegram's bridge script is loaded by `/`, from telegram.org.
-    expect(csp).toContain("script-src 'self' https://telegram.org");
+    // Telegram support is retired -- Android only, loaded via `/app`,
+    // which never included the Telegram bridge tag.
+    expect(csp).toContain("script-src 'self'");
+    expect(csp).not.toContain("script-src 'self' https://telegram.org");
     // Shiki emits inline styles for syntax colours; React sets style attrs.
     expect(csp).toContain("style-src 'self' 'unsafe-inline'");
     // Screenshots arrive as blobs, transcript images as data URIs.

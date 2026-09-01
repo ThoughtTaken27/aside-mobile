@@ -26,9 +26,12 @@ export interface SessionModel {
   provider: string;
   modelId: string;
   thinkingLevel?: string;
+  fastMode?: boolean;
 }
 
 export interface SessionState {
+  /** Current daemon title. */
+  title: string | null;
   /** Display label, or null when it could not be read. */
   permission: string | null;
   /** The raw enum value the daemon stores -- what the picker checkmarks. */
@@ -59,6 +62,7 @@ export function isSuspended(status: string | null | undefined): boolean {
 }
 
 export const UNKNOWN_STATE: SessionState = {
+  title: null,
   permission: null,
   permissionMode: null,
   finalConfirm: null,
@@ -154,6 +158,8 @@ export function parseSessionModel(raw: unknown): SessionModel | null {
       thinkingLevel: parsed.thinkingLevel
         ? String(parsed.thinkingLevel)
         : undefined,
+      fastMode:
+        typeof parsed.fastMode === 'boolean' ? parsed.fastMode : undefined,
     };
   } catch {
     return null;
@@ -246,6 +252,19 @@ export class StateDb {
     return value;
   }
 
+  /** Read through the cache and replace it with the daemon's current row. */
+  async readFresh(sessionId: string): Promise<SessionState> {
+    const value = await this.query(sessionId);
+    this.cache.delete(sessionId);
+    this.cache.set(sessionId, { at: this.now(), value });
+    while (this.cache.size > MAX_STATE_CACHE) {
+      const oldest = this.cache.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      this.cache.delete(oldest);
+    }
+    return value;
+  }
+
   /** Drop a cached row after a write, so the next read reflects it. */
   invalidate(sessionId: string): void {
     this.cache.delete(sessionId);
@@ -297,6 +316,7 @@ export class StateDb {
             runtime_config?: unknown;
             parent_id?: unknown;
             status?: unknown;
+            title?: unknown;
           }
         | undefined;
 
@@ -308,6 +328,7 @@ export class StateDb {
       const mode = String(row.permission_mode ?? '').trim();
 
       return {
+        title: row.title ? String(row.title) : null,
         permission: permissionLabel(row.permission_mode),
         permissionMode: mode || null,
         finalConfirm:

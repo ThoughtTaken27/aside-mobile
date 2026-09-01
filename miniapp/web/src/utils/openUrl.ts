@@ -31,8 +31,14 @@
  */
 import { openExternal } from '../telegram';
 
-/** Aside's page colour, used to tint the Custom Tab chrome. */
-const TOOLBAR = '#F0ECE4';
+/**
+ * The app's page colour, used to tint the Custom Tab chrome.
+ *
+ * Hard-coded rather than read from `--page` because this crosses the
+ * bridge into native code, where CSS tokens do not exist. Keep it equal to
+ * `--page` in `theme/tokens.css`.
+ */
+const TOOLBAR = '#F9F9F7';
 
 /**
  * True when running inside the Capacitor Android shell.

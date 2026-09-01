@@ -329,6 +329,8 @@ export interface ThreadResponse {
   /** Denominator of the context ring, in tokens. */
   contextWindow: number;
   busy: boolean;
+  /** True only when this mobile server owns the process and can cancel it. */
+  stoppable?: boolean;
   queued: number;
   /** Real permission mode; null means unreadable, so show nothing. */
   permission: string | null;

@@ -225,8 +225,9 @@ public class MainActivity extends BridgeActivity {
         }
     }
 
-    /** Aside's page colour, so the tab does not read as a different app. */
-    private static final int TOOLBAR_COLOR = 0xFFF0ECE4;
+    /** The app's page colour, so the tab does not read as a different app.
+     *  Mirrors `--page` in web/src/theme/tokens.css. */
+    private static final int TOOLBAR_COLOR = 0xFFF9F9F7;
 
     /**
      * The methods the page can call into the shell.

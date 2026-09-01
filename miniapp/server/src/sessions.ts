@@ -58,27 +58,95 @@ export function isValidSessionId(id: unknown): id is string {
   return typeof id === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(id);
 }
 
+interface SessionDirectorySnapshot {
+  checkedAt: number;
+  mtimeMs: number;
+  dirs: Map<string, string>;
+}
+
+/**
+ * Short-lived index from Aside's opaque session id to its dated directory.
+ *
+ * A home refresh resolves up to 100 rows twice: once for title/preview and
+ * once for liveness. Re-reading a directory with thousands of sessions for
+ * every id made that route spend about half a second on repeated scans.
+ */
+export class SessionDirectoryIndex {
+  private readonly roots = new Map<string, SessionDirectorySnapshot>();
+
+  constructor(
+    private readonly ttlMs = 1_000,
+    private readonly now: () => number = Date.now,
+  ) {}
+
+  resolve(sessionsDir: string, sessionId: string): string | null {
+    if (!isValidSessionId(sessionId)) return null;
+    const snapshot = this.snapshot(sessionsDir);
+    return snapshot.dirs.get(sessionId) ?? null;
+  }
+
+  private snapshot(sessionsDir: string): SessionDirectorySnapshot {
+    const now = this.now();
+    const hit = this.roots.get(sessionsDir);
+    if (hit && now - hit.checkedAt < this.ttlMs) return hit;
+
+    const rootStat = fs.statSync(sessionsDir, { throwIfNoEntry: false });
+    if (hit && rootStat?.isDirectory() && rootStat.mtimeMs === hit.mtimeMs) {
+      hit.checkedAt = now;
+      this.touch(sessionsDir, hit);
+      return hit;
+    }
+
+    const dirs = new Map<string, string>();
+    if (rootStat?.isDirectory()) {
+      try {
+        const entries = fs.readdirSync(sessionsDir, { withFileTypes: true });
+        for (const entry of entries) {
+          if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
+          const cut = entry.name.lastIndexOf('_');
+          if (cut < 0) continue;
+          const id = entry.name.slice(cut + 1);
+          if (!isValidSessionId(id) || dirs.has(id)) continue;
+          const full = path.join(sessionsDir, entry.name);
+          if (
+            entry.isDirectory() ||
+            fs.statSync(full, { throwIfNoEntry: false })?.isDirectory()
+          ) {
+            dirs.set(id, full);
+          }
+        }
+      } catch {
+        // Missing or temporarily unreadable root is an empty snapshot.
+      }
+    }
+
+    const next = {
+      checkedAt: now,
+      mtimeMs: rootStat?.mtimeMs ?? -1,
+      dirs,
+    };
+    this.touch(sessionsDir, next);
+    return next;
+  }
+
+  private touch(sessionsDir: string, snapshot: SessionDirectorySnapshot): void {
+    this.roots.delete(sessionsDir);
+    this.roots.set(sessionsDir, snapshot);
+    while (this.roots.size > 8) {
+      const oldest = this.roots.keys().next().value as string | undefined;
+      if (oldest === undefined) return;
+      this.roots.delete(oldest);
+    }
+  }
+}
+
+const sessionDirectories = new SessionDirectoryIndex();
+
 export function resolveSessionDir(
   sessionsDir: string,
   sessionId: string,
 ): string | null {
-  if (!isValidSessionId(sessionId)) return null;
-  let names: string[];
-  try {
-    names = fs.readdirSync(sessionsDir);
-  } catch {
-    return null;
-  }
-  const suffix = `_${sessionId}`;
-  for (const name of names) {
-    if (name.endsWith(suffix)) {
-      const full = path.join(sessionsDir, name);
-      if (fs.statSync(full, { throwIfNoEntry: false })?.isDirectory()) {
-        return full;
-      }
-    }
-  }
-  return null;
+  return sessionDirectories.resolve(sessionsDir, sessionId);
 }
 
 export function sessionMsgFile(

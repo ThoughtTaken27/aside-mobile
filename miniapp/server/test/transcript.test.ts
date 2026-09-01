@@ -1,10 +1,49 @@
-import { describe, expect, it } from 'vitest';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
+  LIVE_TRANSCRIPT_WINDOW_MS,
   parseTranscript,
   stripMarkdown,
+  tailIsUnfinishedTurn,
+  TranscriptLiveness,
+  transcriptIsLive,
   TranscriptParser,
 } from '../src/transcript.js';
 import { readFixture } from './helpers.js';
+
+function jsonl(...records: unknown[]): string {
+  return records.map((r) => JSON.stringify(r)).join('\n') + '\n';
+}
+
+const userMsg = { role: 'user', content: 'hi', timestamp: 1 };
+function toolCallMsg(id: string, stopReason = 'toolUse') {
+  return {
+    role: 'assistant',
+    content: [{ type: 'toolCall', id, name: 'read_file', arguments: {} }],
+    stopReason,
+    timestamp: 2,
+  };
+}
+function toolResultMsg(id: string) {
+  return {
+    role: 'toolResult',
+    toolCallId: id,
+    toolName: 'read_file',
+    content: [{ type: 'text', text: 'ok' }],
+    isError: false,
+    timestamp: 3,
+  };
+}
+function assistantTextMsg(stopReason = 'endTurn') {
+  return {
+    role: 'assistant',
+    content: [{ type: 'text', text: 'done' }],
+    stopReason,
+    timestamp: 4,
+  };
+}
 
 describe('transcript parser', () => {
   it('parses text, thinking, tool calls and tool results', () => {
@@ -192,5 +231,149 @@ describe('stripMarkdown', () => {
 
   it('handles empty input', () => {
     expect(stripMarkdown('')).toBe('');
+  });
+});
+
+describe('tailIsUnfinishedTurn', () => {
+  it('treats a fully resolved multi-call turn as finished', () => {
+    // Two tool calls, both resolved, ending on a terminal assistant stop --
+    // this is the exact shape of the fixtureAAAA transcript, and the
+    // regression case: a naive backward walk meets each toolResult BEFORE
+    // the toolCall it answers, since results are always written after
+    // their call. Deleting-on-result before the id exists must not leave
+    // the id looking permanently open.
+    const buffer = jsonl(
+      userMsg,
+      toolCallMsg('call-1'),
+      toolResultMsg('call-1'),
+      toolCallMsg('call-2'),
+      toolResultMsg('call-2'),
+      assistantTextMsg('endTurn'),
+    );
+    expect(tailIsUnfinishedTurn(buffer)).toBe(false);
+  });
+
+  it('treats an open trailing tool call as unfinished', () => {
+    const buffer = jsonl(userMsg, toolCallMsg('call-1'));
+    expect(tailIsUnfinishedTurn(buffer)).toBe(true);
+  });
+
+  it('treats a resolved call followed by a new open call as unfinished', () => {
+    const buffer = jsonl(
+      userMsg,
+      toolCallMsg('call-1'),
+      toolResultMsg('call-1'),
+      toolCallMsg('call-2'),
+    );
+    expect(tailIsUnfinishedTurn(buffer)).toBe(true);
+  });
+
+  it('treats a trailing assistant record with no terminal stop as unfinished', () => {
+    const buffer = jsonl(userMsg, assistantTextMsg('length'));
+    // 'length' is a non-toolUse stop, so per the terminal-stop rule this
+    // IS terminal (anything other than 'toolUse' counts). Use an explicit
+    // in-flight-style value with no stopReason field at all instead.
+    const inFlight = jsonl(userMsg, { ...assistantTextMsg(), stopReason: undefined });
+    expect(tailIsUnfinishedTurn(buffer)).toBe(false);
+    expect(tailIsUnfinishedTurn(inFlight)).toBe(true);
+  });
+
+  it('stops walking back at the user boundary', () => {
+    // An open call from a PRIOR turn, closed by the time of the current
+    // (finished) turn, must not leak liveness across the user boundary.
+    const buffer = jsonl(
+      userMsg,
+      toolCallMsg('old-call'),
+      toolResultMsg('old-call'),
+      assistantTextMsg('endTurn'),
+      userMsg,
+      assistantTextMsg('endTurn'),
+    );
+    expect(tailIsUnfinishedTurn(buffer)).toBe(false);
+  });
+});
+
+describe('transcriptIsLive', () => {
+  let dir: string;
+  let file: string;
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'transcript-live-test-'));
+    file = path.join(dir, 'messages.jsonl');
+  });
+
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('is false for a finished transcript even when freshly written', () => {
+    fs.writeFileSync(
+      file,
+      jsonl(
+        userMsg,
+        toolCallMsg('call-1'),
+        toolResultMsg('call-1'),
+        toolCallMsg('call-2'),
+        toolResultMsg('call-2'),
+        assistantTextMsg('endTurn'),
+      ),
+    );
+    expect(transcriptIsLive(file)).toBe(false);
+  });
+
+  it('is true for an open trailing call within the recency window', () => {
+    fs.writeFileSync(file, jsonl(userMsg, toolCallMsg('call-1')));
+    expect(transcriptIsLive(file)).toBe(true);
+  });
+
+  it('is false once the open call is outside the recency window', () => {
+    fs.writeFileSync(file, jsonl(userMsg, toolCallMsg('call-1')));
+    const stale = Date.now() / 1000 - (LIVE_TRANSCRIPT_WINDOW_MS / 1000 + 60);
+    fs.utimesSync(file, stale, stale);
+    expect(transcriptIsLive(file)).toBe(false);
+  });
+
+  it('is false when the file does not exist', () => {
+    expect(transcriptIsLive(path.join(dir, 'missing.jsonl'))).toBe(false);
+  });
+
+  it('reuses the parsed tail while the file signature is unchanged', () => {
+    const fixedLine = (record: unknown) => {
+      const json = JSON.stringify(record);
+      return `${json}${' '.repeat(512 - json.length)}\n`;
+    };
+    const fixedTime = new Date('2026-08-24T12:00:00.000Z');
+    const now = fixedTime.getTime() + 1_000;
+    const liveness = new TranscriptLiveness();
+
+    fs.writeFileSync(file, fixedLine({ ...assistantTextMsg(), stopReason: undefined }));
+    fs.utimesSync(file, fixedTime, fixedTime);
+    expect(liveness.isLive(file, { now: () => now })).toBe(true);
+
+    // Same path, size and mtime: the expensive tail classification is reused.
+    fs.writeFileSync(file, fixedLine(assistantTextMsg('endTurn')));
+    fs.utimesSync(file, fixedTime, fixedTime);
+    expect(liveness.isLive(file, { now: () => now })).toBe(true);
+  });
+
+  it('parses the tail again after the file signature changes', () => {
+    const liveness = new TranscriptLiveness();
+    fs.writeFileSync(file, jsonl(userMsg, toolCallMsg('call-1')));
+    expect(liveness.isLive(file)).toBe(true);
+
+    fs.writeFileSync(file, jsonl(userMsg, assistantTextMsg('endTurn')));
+    expect(liveness.isLive(file)).toBe(false);
+  });
+
+  it('recalculates recency even when the parsed tail is cached', () => {
+    const liveness = new TranscriptLiveness();
+    const writtenAt = new Date('2026-08-24T12:00:00.000Z');
+    let now = writtenAt.getTime() + 1_000;
+    fs.writeFileSync(file, jsonl(userMsg, toolCallMsg('call-1')));
+    fs.utimesSync(file, writtenAt, writtenAt);
+
+    expect(liveness.isLive(file, { now: () => now })).toBe(true);
+    now += LIVE_TRANSCRIPT_WINDOW_MS + 1;
+    expect(liveness.isLive(file, { now: () => now })).toBe(false);
   });
 });

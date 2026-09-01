@@ -55,9 +55,9 @@ const config: CapacitorConfig = {
   // Required to exist even when `server.url` wins at runtime. It is also
   // the payload a future offline shell would fall back to.
   webDir: 'dist',
-  // Matches the app's warm cream page, so the window behind the WebView
-  // does not flash white before first paint.
-  backgroundColor: '#F0ECE4',
+  // Matches the app's page colour (`--page`), so the window behind the
+  // WebView does not flash a different shade before first paint.
+  backgroundColor: '#F9F9F7',
   server: {
     url: `https://${tailnetHost}/app`,
     androidScheme: 'https',
@@ -74,7 +74,7 @@ const config: CapacitorConfig = {
   android: {
     // The app draws its own warm background; the default white splash
     // between process start and first paint is the jarring part.
-    backgroundColor: '#F0ECE4',
+    backgroundColor: '#F9F9F7',
     /*
      * Mixed content stays off. Nothing in the app needs it, and leaving
      * it on would let a downgraded asset through on a network that is
