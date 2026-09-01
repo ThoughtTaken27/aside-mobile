@@ -7,6 +7,7 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
+import zlib from 'node:zlib';
 import crypto from 'node:crypto';
 import Fastify, { type FastifyInstance, type FastifyRequest } from 'fastify';
 import rateLimit from '@fastify/rate-limit';
@@ -20,7 +21,7 @@ import {
 } from './config.js';
 import {
   FacadeCache,
-  fetchDefaultModel,
+  peekDefaultModel,
   fetchRoutines,
   fetchSession,
   markSessionRead,
@@ -34,6 +35,7 @@ import {
 } from './catalog.js';
 import { readDesktopState } from './desktop.js';
 import { TranscribeError, transcribeAudio } from './transcribe.js';
+import { WhisperServer } from './whisperserver.js';
 import { derivePairingKey } from './pair.js';
 import { StateDb, isFullAccess, isSuspended } from './statedb.js';
 import { SettingsStore, defaultSettingsPath, resolveNewSessionModel } from './settings.js';
@@ -94,7 +96,7 @@ import { VisitStore } from './visits.js';
 import { buildOmnibox, buildZeroState } from './omnibox.js';
 import { asUrl } from './urlguess.js';
 import { HistoryReader } from './history.js';
-import { parseTranscript } from './transcript.js';
+import { parseTranscript, transcriptIsLive } from './transcript.js';
 import { buildThread } from './thread.js';
 import { readHistory } from './jsonl.js';
 import {
@@ -112,6 +114,7 @@ import { SoftConfirmStore, defaultSoftConfirmPath } from './softconfirm.js';
 import { TurnRunner } from './exec.js';
 import { WatcherRegistry } from './watcher.js';
 import { attachWebSocket } from './ws.js';
+import { OwnedTurns } from './ownedturns.js';
 import { ActiveViewers } from './viewers.js';
 import { Notifier, LONG_RUNNING_THRESHOLD_MS } from './notify.js';
 import type { ThreadItem } from './thread.js';
@@ -131,6 +134,7 @@ import {
   resolveMemoryFile,
 } from './memorybrowser.js';
 import { searchTranscripts } from './search.js';
+import { applySessionModel } from './sessionmodel.js';
 
 const MAX_MESSAGE_CHARS = 32_000;
 const DEFAULT_ENTRY_LIMIT = 800;
@@ -376,6 +380,22 @@ export async function buildServer(
    * Subagents of a session, read from the daemon's table and kept warm so
    * the synchronous thread build can see them. See `SubagentIndex`.
    */
+  /** Tracks turns this server ran, so their tail is not read as liveness. */
+  const ownedTurns = new OwnedTurns();
+
+  /**
+   * A resident whisper.cpp, started on the first dictation and kept warm.
+   *
+   * See `whisperserver.ts`: roughly half of every transcription's wall
+   * clock was the same model being loaded off disk again. Lazy, so a user
+   * who never dictates never pays the memory for it.
+   */
+  const whisperServer = new WhisperServer({
+    modelPath: config.whisperModelPath,
+    language: config.whisperLanguage || 'en',
+  });
+  app.addHook('onClose', async () => whisperServer.dispose());
+
   const subagents = new SubagentIndex(async (parentId) => {
     const rows = await stateDb.children(parentId);
     if (!rows) return null;
@@ -463,6 +483,7 @@ export async function buildServer(
   const longRunningTimers = new Map<string, NodeJS.Timeout>();
 
   runner.on('turn_started', (turn) => {
+    ownedTurns.markStarted(turn.sessionId);
     notifier.beginTurn(turn.sessionId, turn.startedAt);
     const existingTimer = longRunningTimers.get(turn.sessionId);
     if (existingTimer) clearTimeout(existingTimer);
@@ -484,6 +505,13 @@ export async function buildServer(
   });
 
   runner.on('turn_finished', (turn) => {
+    // Before anything else: our child is gone, so the transcript's freshly
+    // bumped mtime is our own tail and must not keep the composer showing
+    // a stop control for the next thirty seconds.
+    ownedTurns.markFinished(
+      turn.sessionId,
+      sessionMsgFile(config.sessionsDir, turn.sessionId),
+    );
     const existingTimer = longRunningTimers.get(turn.sessionId);
     if (existingTimer) {
       clearTimeout(existingTimer);
@@ -560,9 +588,10 @@ export async function buildServer(
     : "'self' https://web.telegram.org https://*.telegram.org";
   const contentSecurityPolicy = [
     "default-src 'self'",
-    // telegram.org hosts the WebApp bridge script that `/` loads. `/app`
-    // strips that tag, but the same server answers both.
-    "script-src 'self' https://telegram.org",
+    // Telegram support is retired -- Android app only now, loaded via
+    // `/app`, which never included the Telegram bridge tag. `/` used to
+    // need telegram.org here for that script; nothing loads it anymore.
+    "script-src 'self'",
     // Shiki writes per-token colours as inline styles, and React sets
     // style attributes, both of which this blocks without 'unsafe-inline'.
     "style-src 'self' 'unsafe-inline'",
@@ -592,6 +621,74 @@ export async function buildServer(
      */
     reply.header('strict-transport-security', 'max-age=31536000');
     return payload;
+  });
+
+  /**
+   * Compress JSON and text responses on the way out.
+   *
+   * The static bundle is precompressed at build time (see `preCompressed`
+   * below), but the API was not compressed at all, and the API is what the
+   * phone fetches constantly. A real thread payload measured against this
+   * service on 2026-09-01 was 383KB of JSON for one open, and the session
+   * list is 12KB on every poll. JSON of this shape -- thousands of
+   * repeated keys -- compresses roughly six to one, so this is most of a
+   * phone's transfer time on every screen.
+   *
+   * Deliberately hand-rolled rather than pulling in `@fastify/compress`:
+   * the rule needed here is small and the failure modes of getting it
+   * wrong are large, so it is easier to read all of it. The guards are the
+   * point:
+   *
+   *  - only string and Buffer payloads, so streamed file downloads and
+   *    image responses pass through untouched;
+   *  - never when something upstream already set `content-encoding`, which
+   *    is exactly what the precompressed static handler does;
+   *  - only above a size where the framing overhead is worth it;
+   *  - `vary: accept-encoding` always, so a cache can never serve a
+   *    compressed body to a client that did not ask for one.
+   */
+  const COMPRESSIBLE_TYPE = /^(?:application\/(?:json|javascript)|text\/)/i;
+  const COMPRESS_MIN_BYTES = 1024;
+  app.addHook('onSend', async (request, reply, payload) => {
+    const isText = typeof payload === 'string';
+    if (!isText && !Buffer.isBuffer(payload)) return payload;
+    if (reply.getHeader('content-encoding')) return payload;
+
+    const type = String(reply.getHeader('content-type') || '');
+    if (!COMPRESSIBLE_TYPE.test(type)) return payload;
+
+    const body = isText ? Buffer.from(payload, 'utf8') : (payload as Buffer);
+    // `vary` goes on every compressible response, not just the ones that
+    // end up compressed, or an intermediary could cache the uncompressed
+    // answer under a key that also matches a client asking for brotli.
+    reply.header('vary', 'accept-encoding');
+    if (body.byteLength < COMPRESS_MIN_BYTES) return payload;
+
+    const accepted = String(request.headers['accept-encoding'] || '');
+    let encoded: Buffer;
+    let encoding: string;
+    if (/\bbr\b/.test(accepted)) {
+      encoding = 'br';
+      encoded = zlib.brotliCompressSync(body, {
+        params: {
+          // Quality 5, not 11: this runs per request on live data, where
+          // the extra few percent costs more milliseconds than it saves.
+          // The build-time pass over the static bundle uses 11.
+          [zlib.constants.BROTLI_PARAM_QUALITY]: 5,
+          [zlib.constants.BROTLI_PARAM_SIZE_HINT]: body.byteLength,
+        },
+      });
+    } else if (/\bgzip\b/.test(accepted)) {
+      encoding = 'gzip';
+      encoded = zlib.gzipSync(body, { level: 6 });
+    } else {
+      return payload;
+    }
+
+    if (encoded.byteLength >= body.byteLength) return payload;
+    reply.header('content-encoding', encoding);
+    reply.header('content-length', encoded.byteLength);
+    return encoded;
   });
 
   await app.register(rateLimit, {
@@ -1034,6 +1131,9 @@ export async function buildServer(
         const { text, ms } = await transcribeAudio(audio, {
           modelPath: config.whisperModelPath,
           language: language || config.whisperLanguage || 'en',
+          // Null when the resident server is unavailable, in which case
+          // `transcribeAudio` runs the CLI exactly as it always did.
+          serverPort: whisperServer.portIfReady(),
         });
         request.log.info({ ms, chars: text.length }, 'transcribed');
         return { text, ms };
@@ -1050,6 +1150,29 @@ export async function buildServer(
         request.log.error({ err }, 'transcribe crashed');
         return reply.code(500).send({ error: 'internal' });
       }
+    },
+  );
+
+  /**
+   * Load the speech model while the user is still talking.
+   *
+   * The client calls this the moment the mic button goes down. Cold start
+   * is dominated by reading the model into memory, and a dictation takes
+   * seconds -- so doing the two concurrently means the FIRST take after a
+   * restart is as quick as every one after it, instead of being the one
+   * that feels broken.
+   *
+   * Returns immediately either way: this is a hint, not a dependency.
+   */
+  app.post(
+    '/api/transcribe/warm',
+    {
+      preHandler: requireAuth,
+      config: { rateLimit: { max: 60, timeWindow: '1 minute' } },
+    },
+    async () => {
+      whisperServer.warm();
+      return { ok: true };
     },
   );
 
@@ -1120,10 +1243,28 @@ export async function buildServer(
       // status), or sitting on an answerable soft-marker question nobody
       // has tapped (notifier's tracked state -- see the turn_finished
       // hook above). Cheap either way: no extra transcript reads.
-      const sessions = rows.map((row) => ({
-        ...row,
-        waiting: isSuspended(row.status) || notifier.isWaiting(row.id),
-      }));
+      const sessions = rows.map((row) => {
+        /**
+         * A row's own `status` never says `running` for a Mac-started
+         * turn -- same root cause as the thread route: `runner.isBusy`
+         * only knows this server's own turns, and the daemon's status
+         * column never reaches `running` in practice. Without this, the
+         * list row for a live desktop turn shows no spinner at all, and
+         * the only way to see it running was to open the thread. The
+         * transcript check runs only for rows within the liveness window
+         * (a cheap statSync first), so this stays affordable across a
+         * full list poll.
+         */
+        const msgFile = sessionMsgFile(config.sessionsDir, row.id);
+        const live =
+          runner.isBusy(row.id) ||
+          (msgFile ? transcriptIsLive(msgFile) : false);
+        return {
+          ...row,
+          status: live ? 'running' : row.status,
+          waiting: isSuspended(row.status) || notifier.isWaiting(row.id),
+        };
+      });
       return { sessions, source };
     },
   );
@@ -1229,8 +1370,48 @@ export async function buildServer(
         return reply.code(404).send({ error: 'session_not_found' });
       }
 
-      const session = await fetchSession(facade, id).catch(() => null);
-      const running = runner.isBusy(id) || session?.status === 'running';
+      /**
+       * The session's title, status, permission mode and pinned model,
+       * read straight from the daemon's own SQLite.
+       *
+       * This route USED to await `fetchSession(facade, id)` as well, for
+       * nothing but the title and the status -- both of which are columns
+       * in the row being read here. That call spawns the ~139MB CLI, and
+       * it is what made opening a chat on the phone take between eleven
+       * and twenty seconds. Measured against the live service on
+       * 2026-09-01, over five real sessions: 11427ms, 13278ms, 20039ms,
+       * 20039ms, and 3ms for the one empty session. The three that took
+       * twenty seconds hit the facade's own timeout exactly -- that is the
+       * "it often doesn't even load" case, and it got WORSE the more the
+       * desktop was doing, because a busy daemon answers a repl spawn more
+       * slowly. The same requests warm off the cache in 7-9ms.
+       *
+       * The daemon's table is not a second-best source here. It is the
+       * same store the facade would have queried, one process closer.
+       */
+      const state = await stateDb.read(id);
+      const status = state.status || 'idle';
+      /**
+       * `running` has to be true for a turn started from the Mac too, not
+       * just one this server itself spawned.
+       *
+       * `runner.isBusy` only knows about turns this process launched.
+       * `session?.status === 'running'` is dead code in practice: the
+       * daemon's own state.db status column never actually reaches
+       * `running` (verified against 1,109 real rows -- zero of them). So
+       * a desktop-started turn had no liveness signal at all, and every
+       * such turn rendered on the phone as a collapsed, finished fold
+       * until the user tapped in. `transcriptIsLive` fills that gap by
+       * reading the transcript's own tail instead of relying on either
+       * process to say so.
+       */
+      const running =
+        runner.isBusy(id) ||
+        isSuspended(status) ||
+        // `status === 'running'` is not consulted: the daemon's column never
+        // reaches it in practice (verified against 1,109 rows), and it goes
+        // STALE -- rows sit at 'running' long after their process is gone.
+        (!ownedTurns.settled(id, msgFile) && transcriptIsLive(msgFile));
       // A thread open is the one place worth paying for a fresh child read
       // rather than whatever the index happens to hold.
       const children = await subagents.refresh(id);
@@ -1245,20 +1426,6 @@ export async function buildServer(
 
       // Best-effort; a failure here must not block the read.
       void markSessionRead(facade, id);
-
-      // The session's real permission mode and pinned model. Both are null
-      // when unreadable, and the client hides rather than guesses.
-      const state = await stateDb.read(id);
-
-      /**
-       * The daemon's own status wins over the facade's.
-       *
-       * `suspended` -- blocked on a native question tool -- is the state
-       * the composer has to know about, and it is in the table. Sending a
-       * message to a suspended session queues an `aside exec` that hangs
-       * forever, so the client disables the composer on it and says why.
-       */
-      const status = state.status || session?.status || 'idle';
 
       /**
        * A session started from a phone: this app's own, or bridge.py's.
@@ -1279,7 +1446,7 @@ export async function buildServer(
        * did not, so the same session showed a real title in the list and a
        * placeholder once opened. Same rule, applied in both places now.
        */
-      const rawTitle = session?.title || '';
+      const rawTitle = state.title || '';
       const title = isPlaceholderTitle(rawTitle)
         ? titleFromTranscript(config.sessionsDir, id) || rawTitle
         : rawTitle;
@@ -1318,7 +1485,9 @@ export async function buildServer(
         contextWindow: state.model
           ? contextWindowFor(catalog, state.model.provider, state.model.modelId)
           : contextWindowFor(catalog, 'claude-code', config.defaultModel),
-        busy: runner.isBusy(id),
+        busy: running,
+        /** Only a child process launched by this server can be cancelled here. */
+        stoppable: runner.isBusy(id),
         queued: runner.queuedCount(id),
         permission: state.permission,
         permissionMode: state.permissionMode,
@@ -2120,21 +2289,87 @@ export async function buildServer(
     },
   );
 
+  /** Persist a thread's model and reasoning level in the desktop daemon. */
+  app.post(
+    '/api/sessions/:id/model',
+    { preHandler: requireAuth },
+    async (request, reply) => {
+      const { id } = request.params as { id: string };
+      const body = (request.body || {}) as Record<string, unknown>;
+      if (!isValidSessionId(id)) {
+        return reply.code(400).send({ error: 'bad_session_id' });
+      }
+      if (!sessionMsgFile(config.sessionsDir, id)) {
+        return reply.code(404).send({ error: 'session_not_found' });
+      }
+      const provider = String(body.provider || '').trim();
+      const modelId = String(body.modelId || '').trim();
+      const thinkingLevel = String(body.effort || '').trim();
+      const providerEntry = currentCatalog().find((entry) => entry.id === provider);
+      if (!providerEntry?.models.some((entry) => entry.id === modelId)) {
+        return reply.code(400).send({ error: 'bad_model' });
+      }
+      if (!EFFORT_LEVELS.includes(thinkingLevel as any)) {
+        return reply.code(400).send({ error: 'bad_effort' });
+      }
+
+      const current = await stateDb.readFresh(id);
+      try {
+        await applySessionModel(
+          facade,
+          id,
+          { provider, modelId, thinkingLevel },
+          current.model,
+        );
+      } catch (err) {
+        request.log.error({ err }, 'session model update failed');
+        return reply.code(502).send({ error: 'model_update_failed' });
+      }
+      stateDb.invalidate(id);
+      facade.invalidate(`session:${id}`);
+
+      // The daemon owns the result. Read it back instead of echoing a wish.
+      const state = await stateDb.readFresh(id);
+      const actual = state.model;
+      return {
+        ok: true,
+        model: actual
+          ? {
+              provider: actual.provider,
+              modelId: actual.modelId,
+              label: modelLabel(catalog, actual.provider, actual.modelId),
+              effort: actual.thinkingLevel || null,
+              effortLabel: actual.thinkingLevel
+                ? EFFORT_LABELS[actual.thinkingLevel] || actual.thinkingLevel
+                : null,
+            }
+          : null,
+        appliesFrom: 'next-message',
+      };
+    },
+  );
+
   app.get('/api/status', { preHandler: requireAuth }, async () => {
     const status = runner.status();
 
     // Aside's own current default, so the pills open showing what the
     // browser shows rather than a config guess.
     //
-    // Three sources, most authoritative first. The daemon is asked first
-    // because it is the live answer, but it needs a ~139MB process spawn
-    // and fails whenever the desktop app is not running -- and it was
-    // failing to `claude-code` + whatever stale string the bridge config
-    // carried, which is how the phone came to show a model the desktop had
-    // not used in days. settings.json is the same value the daemon would
-    // have reported, read straight off disk, so it is a far better second
-    // than the hand-maintained config.
-    const daemonDefault = await fetchDefaultModel(facade).catch(() => null);
+    // Three sources, most authoritative first. settings.json is the same
+    // value the daemon would report, read straight off disk, so it is a far
+    // better second than the hand-maintained config -- the config had gone
+    // stale enough that the phone showed a model the desktop had not used
+    // in days.
+    //
+    // The daemon is PEEKED, not awaited. Asking it costs a ~139MB process
+    // spawn, and this route is fetched during app boot: measured against
+    // the live service on 2026-09-01, awaiting it made `/api/status` take
+    // 6562ms while `/api/sessions` next to it took 39ms. Since the disk
+    // copy answers the same question, waiting bought nothing and cost the
+    // whole boot. The peek serves the last value and refreshes behind the
+    // response, so the daemon's answer is still what shows -- one request
+    // later at worst.
+    const daemonDefault = peekDefaultModel(facade);
     const desktop = readDesktopState(config.sessionsDir);
     const fallback = desktop.defaultModel;
 
@@ -2210,14 +2445,29 @@ export async function buildServer(
 
   // --- SPA hosting -------------------------------------------------------
   if (opts.webDist && fs.existsSync(opts.webDist)) {
+    const webDist = opts.webDist;
     /*
      * `index: false` because `/` is handled explicitly below. Left on, the
      * static plugin answers `/` with the raw `index.html` and there is no
      * way to register a route that gets there first.
      */
     await app.register(fastifyStatic, {
-      root: opts.webDist,
+      root: webDist,
       index: false,
+      /**
+       * Serve the `.br` / `.gz` the build emits alongside each asset.
+       *
+       * Without this the phone downloaded the bundle raw: measured against
+       * this service, the main chunk was 512KB with no content-encoding at
+       * all, out of 1.99MB of emitted JS and CSS. Compressed that set is
+       * 522KB. Over a tailnet from a phone this was the single largest
+       * component of "everything loads slow", and it was paid again on
+       * every new build because the URLs are content-hashed.
+       *
+       * Precompressed rather than on-the-fly: these files never change, so
+       * the CPU cost belongs in the build, not in the request path.
+       */
+      preCompressed: true,
       /*
        * The APK has no Content-Disposition without this, and mobile Chrome
        * is inconsistent about turning a bare `application/vnd.android.
@@ -2232,6 +2482,20 @@ export async function buildServer(
             'Content-Disposition',
             `attachment; filename="${path.basename(filePath)}"`,
           );
+        }
+        /*
+         * Vite content-hashes everything under /assets/ (and the icon set
+         * under /icons/ never changes without a filename change either),
+         * so these are safe to cache forever -- a changed file gets a new
+         * URL, it never overwrites the old one in place. Without this
+         * every launch revalidates ~575KB over the tailnet for bytes that
+         * cannot have changed. HTML (`/`, `/app`) deliberately keeps the
+         * default no-cache behavior below since that's what points at the
+         * current hashed asset names.
+         */
+        const rel = path.relative(webDist, filePath);
+        if (rel.startsWith(`assets${path.sep}`) || rel.startsWith(`icons${path.sep}`)) {
+          reply.header('cache-control', 'public, max-age=31536000, immutable');
         }
       },
     });
@@ -2266,7 +2530,7 @@ export async function buildServer(
             '</head>',
             [
               '  <link rel="manifest" href="/manifest.webmanifest" />',
-              '  <meta name="theme-color" content="#faf9f6" />',
+              '  <meta name="theme-color" content="#f9f9f7" />',
               '  <meta name="mobile-web-app-capable" content="yes" />',
               '  <meta name="apple-mobile-web-app-capable" content="yes" />',
               /*
@@ -2681,6 +2945,47 @@ export async function buildServer(
     subagents,
     jwtSecret: opts.jwtSecret,
     viewers,
+    readSessionState: async (id) => {
+      const state = await stateDb.readFresh(id);
+      const file = sessionMsgFile(config.sessionsDir, id);
+      const status = state.status || 'idle';
+      const mobile = isMobileSession(config.sessionsDir, id);
+      const rawTitle = state.title || '';
+      const title = isPlaceholderTitle(rawTitle)
+        ? titleFromTranscript(config.sessionsDir, id) || rawTitle
+        : rawTitle;
+      const model = state.model
+        ? {
+            provider: state.model.provider,
+            modelId: state.model.modelId,
+            label: modelLabel(catalog, state.model.provider, state.model.modelId),
+            effort: state.model.thinkingLevel || null,
+            effortLabel: state.model.thinkingLevel
+              ? EFFORT_LABELS[state.model.thinkingLevel] || state.model.thinkingLevel
+              : null,
+          }
+        : null;
+      return {
+        title,
+        status,
+        busy:
+          runner.isBusy(id) ||
+          isSuspended(status) ||
+          (!ownedTurns.settled(id, file) &&
+            Boolean(file && transcriptIsLive(file))),
+        stoppable: runner.isBusy(id),
+        queued: runner.queuedCount(id),
+        permission: state.permission,
+        permissionMode: state.permissionMode,
+        finalConfirm: mobile ? softConfirm.has(id) : state.finalConfirm,
+        softConfirm: mobile,
+        model,
+        contextWindow: state.model
+          ? contextWindowFor(catalog, state.model.provider, state.model.modelId)
+          : contextWindowFor(catalog, 'claude-code', config.defaultModel),
+        suspended: isSuspended(status),
+      };
+    },
   });
 
   app.addHook('onClose', async () => {

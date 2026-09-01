@@ -3,6 +3,7 @@ import ReactMarkdown, { defaultUrlTransform } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { api } from '../api';
 import { CodeBlock } from './CodeBlock';
+import { openImage } from './ImageLightbox';
 import { normalizeLang, warmHighlighter } from '../utils/highlighter';
 import {
   citationIndexFrom,
@@ -11,7 +12,7 @@ import {
   type CitationMark,
 } from '../utils/citations';
 import { localImagePath } from '../utils/images';
-import { closeOpenFence } from '../utils/markdown';
+import { closeOpenFence, fenceLanguages } from '../utils/markdown';
 import type { CitationSource } from '../types';
 
 /**
@@ -55,14 +56,31 @@ function MarkdownImage({
       </span>
     );
   }
+  /*
+   * A button, not a bare image.
+   *
+   * A screenshot the agent produced is rendered at thread width, which on a
+   * phone is far too small to read one. Tapping it did nothing at all, so
+   * the only way to see the detail was to go to the Mac. It opens the
+   * pinch-zoom viewer now; keeping it a real `<button>` means the keyboard
+   * and screen readers get the same affordance the thumb does.
+   */
   return (
-    <img
-      className="md-image"
-      src={resolved}
-      alt={alt}
-      loading="lazy"
-      onError={() => setFailed(true)}
-    />
+    <button
+      type="button"
+      className="md-image-button"
+      aria-label={alt ? `View image: ${alt}` : 'View image'}
+      onClick={() => openImage({ src: resolved, alt })}
+    >
+      <img
+        className="md-image"
+        src={resolved}
+        alt={alt}
+        loading="lazy"
+        draggable={false}
+        onError={() => setFailed(true)}
+      />
+    </button>
   );
 }
 
@@ -101,16 +119,24 @@ export const Markdown = memo(function Markdown({
     return transformCitations(body, (ref) => Boolean(sources?.[ref]));
   }, [text, streaming, sources]);
 
-  // Kicks off Shiki's lazy load after first paint, not at module scope --
-  // importing this component never costs anything until a message has
-  // actually rendered. `warmHighlighter` is idempotent (see
-  // utils/highlighter.ts), so calling it from every mounted `Markdown`
-  // instance -- and there is one per thread item -- costs nothing beyond
-  // the first real call.
+  /*
+   * The languages this particular message actually contains.
+   *
+   * Scanning the source for fence tags is far cheaper than downloading a
+   * grammar nobody asked for. A message with no fences -- the overwhelming
+   * majority -- yields an empty list and costs the highlighter nothing at
+   * all, which is the point: the previous version warmed every grammar and
+   * the WASM engine from every mounted message.
+   */
+  const fenceLangs = useMemo(() => fenceLanguages(markdown), [markdown]);
+
+  // After first paint, never at module scope: importing this component
+  // costs nothing until a message with code in it has rendered.
   useEffect(() => {
-    const id = window.setTimeout(() => warmHighlighter(), 0);
+    if (!fenceLangs.length) return undefined;
+    const id = window.setTimeout(() => warmHighlighter(fenceLangs), 0);
     return () => window.clearTimeout(id);
-  }, []);
+  }, [fenceLangs]);
 
   const imageRenderer = useMemo(
     () =>

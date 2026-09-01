@@ -160,6 +160,42 @@ export class FacadeCache {
     return (await promise) as T;
   }
 
+  /**
+   * Cached value if there is a usable one, otherwise null -- and never a
+   * wait on the CLI.
+   *
+   * Every `call` that misses pays for a ~139MB process spawn. On a route
+   * the app loads at boot that is not a cache miss, it is a stall:
+   * `/api/status` measured 6.5 SECONDS against the live service on
+   * 2026-09-01 because it awaited exactly one such call, and the model pill
+   * could not render until it returned.
+   *
+   * This is the stale-while-revalidate half of `call`. The caller gets an
+   * answer immediately -- the last known value, or null so it can fall
+   * back to a disk source -- and the refresh happens behind the response.
+   * `staleMs` is deliberately separate from and larger than the caller's
+   * freshness target: a value that is merely old is still far better than
+   * a spinner, and the background refresh will have replaced it by the
+   * next request.
+   */
+  peek<T>(
+    key: string,
+    expression: string,
+    refreshAfterMs: number,
+    staleMs = refreshAfterMs * 20,
+  ): T | null {
+    const hit = this.entries.get(key);
+    const age = hit ? this.now() - hit.at : Infinity;
+    if (age > refreshAfterMs && !this.inflight.has(key)) {
+      // Rejections are swallowed on purpose: the desktop app may simply not
+      // be running, which is a normal state for this server, not an error
+      // worth failing a request over.
+      void this.call<T>(key, expression, 0).catch(() => null);
+    }
+    if (!hit || age > staleMs) return null;
+    return hit.value as T;
+  }
+
   /** Fire-and-forget mutations must never be served from cache. */
   mutate(expression: string): Promise<unknown> {
     return this.run(expression);
@@ -260,8 +296,30 @@ export function fetchDefaultModel(
   cache: FacadeCache,
 ): Promise<FacadeDefaultModel | null> {
   return cache.call<FacadeDefaultModel | null>(
-    'settings:defaultModel',
-    'aside.settings.getAll().defaultModel',
+    DEFAULT_MODEL_KEY,
+    DEFAULT_MODEL_EXPRESSION,
+    30_000,
+  );
+}
+
+const DEFAULT_MODEL_KEY = 'settings:defaultModel';
+const DEFAULT_MODEL_EXPRESSION = 'aside.settings.getAll().defaultModel';
+
+/**
+ * The daemon's default model without blocking on it.
+ *
+ * `/api/status` is fetched during app boot, so it must not be the thing
+ * that decides how long boot takes. The disk copy of the same value
+ * (`settings.json`, which the desktop app itself writes) is the caller's
+ * fallback and is never more than momentarily behind, so returning null
+ * here costs correctness nothing.
+ */
+export function peekDefaultModel(
+  cache: FacadeCache,
+): FacadeDefaultModel | null {
+  return cache.peek<FacadeDefaultModel | null>(
+    DEFAULT_MODEL_KEY,
+    DEFAULT_MODEL_EXPRESSION,
     30_000,
   );
 }

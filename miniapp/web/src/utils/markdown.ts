@@ -24,3 +24,22 @@ export function closeOpenFence(text: string): string {
   }
   return fence ? `${text}\n${fence}` : text;
 }
+
+/**
+ * The fence tags a piece of markdown opens, in order of first appearance.
+ *
+ * Used to decide which syntax grammars are worth downloading. Deliberately
+ * a cheap regular expression rather than a parse: a false positive costs
+ * one small grammar chunk, and a false negative costs a code block that
+ * renders as plain monospace, which is already the fallback.
+ */
+export function fenceLanguages(markdown: string): string[] {
+  const found: string[] = [];
+  const fence = /^[ \t]*(?:```|~~~)[ \t]*([A-Za-z0-9_+-]+)/gm;
+  let match: RegExpExecArray | null;
+  while ((match = fence.exec(markdown)) !== null) {
+    const tag = match[1].toLowerCase();
+    if (!found.includes(tag)) found.push(tag);
+  }
+  return found;
+}

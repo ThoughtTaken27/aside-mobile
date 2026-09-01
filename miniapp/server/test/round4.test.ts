@@ -115,7 +115,20 @@ describe('GET /api/status defaults', () => {
     });
     await bootWith(shim);
 
-    const body = await status();
+    /*
+     * The route no longer WAITS for the daemon, so the daemon's value is
+     * the one that eventually shows rather than the one in the first
+     * response. That is deliberate and is the fix for a measured 6562ms
+     * `/api/status` on the live service -- see `peekDefaultModel`. The
+     * contract being pinned here is unchanged: when the daemon answers, its
+     * value wins over the bridge config's. Only the timing moved.
+     */
+    let body = await status();
+    for (let attempt = 0; attempt < 40 && body.defaults.modelId !== 'claude-fable-5'; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      body = await status();
+    }
+
     expect(body.defaults.provider).toBe('claude-code');
     expect(body.defaults.modelId).toBe('claude-fable-5');
     expect(body.defaults.modelLabel).toBe('Fable 5');
@@ -123,6 +136,33 @@ describe('GET /api/status defaults', () => {
     expect(body.defaults.effortLabel).toBe('Extra High');
     // The config value must NOT have won.
     expect(body.defaults.modelId).not.toBe('claude-sonnet-5');
+  });
+
+  /**
+   * The reason the test above had to learn to wait.
+   *
+   * `/api/status` is fetched during app boot, and it used to `await` a
+   * facade call -- a ~139MB process spawn. Measured against the live
+   * service on 2026-09-01 that made the route take 6562ms while
+   * `/api/sessions` beside it took 39ms, and the model pill could not paint
+   * until it returned. A stub CLI that never answers stands in for the
+   * worst case (a sleeping or missing desktop app), which used to hang this
+   * route for its full 20s facade timeout.
+   */
+  it('answers immediately even when the daemon never does', async () => {
+    const hang = path.join(env.root, 'hang.sh');
+    // Long enough to be unmistakable, killed with the app in afterEach.
+    fs.writeFileSync(hang, '#!/bin/sh\nsleep 30\n', { mode: 0o755 });
+    await bootWith(hang);
+
+    const started = Date.now();
+    const body = await status();
+    const elapsed = Date.now() - started;
+
+    expect(elapsed).toBeLessThan(1_000);
+    // And it still answers with something usable rather than a null pill.
+    expect(body.defaults.provider).toBeTruthy();
+    expect(body.defaults.modelId).toBeTruthy();
   });
 
   /**

@@ -2,6 +2,7 @@
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import zlib from 'node:zlib';
 import { defineConfig, type Plugin } from 'vitest/config';
 import react from '@vitejs/plugin-react';
 
@@ -48,10 +49,68 @@ function swBuildId(): Plugin {
   };
 }
 
+/**
+ * Emit `.br` and `.gz` next to every compressible build artefact.
+ *
+ * The server was shipping the bundle raw. Measured against the live
+ * service on 2026-09-01: `/assets/index-<hash>.js` came back as 512KB with
+ * `content-encoding: none`, and the whole emitted JS+CSS set is 1.99MB.
+ * The same bytes gzip to 522KB and brotli to less again. On a phone
+ * reaching the Mac over a tailnet, that difference IS the "everything
+ * loads very slow" complaint -- it is several seconds of transfer on the
+ * first launch of every new build, before a single byte can be parsed.
+ *
+ * Compressing at build time rather than per request is the right trade
+ * here: these files are content-hashed and immutable, so the work is done
+ * once instead of on every cold cache, and the server can hand the
+ * precompressed file straight to the socket. `@fastify/static`'s
+ * `preCompressed` option is what picks them up.
+ */
+function precompressAssets(): Plugin {
+  /** Below this, framing overhead eats the saving. */
+  const MIN_BYTES = 1024;
+  const COMPRESSIBLE = /\.(js|mjs|css|html|json|svg|webmanifest|map)$/i;
+  return {
+    name: 'precompress-assets',
+    apply: 'build',
+    // After `closeBundle` so the service worker has already been stamped;
+    // compressing it before that would ship a `.br` of the unstamped file.
+    enforce: 'post',
+    closeBundle: {
+      order: 'post',
+      handler() {
+        const dist = path.resolve(__dirname, 'dist');
+        if (!fs.existsSync(dist)) return;
+        const walk = (dir: string): string[] =>
+          fs.readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+            const full = path.join(dir, entry.name);
+            if (entry.isDirectory()) return walk(full);
+            return COMPRESSIBLE.test(entry.name) ? [full] : [];
+          });
+        for (const file of walk(dist)) {
+          const raw = fs.readFileSync(file);
+          if (raw.byteLength < MIN_BYTES) continue;
+          const br = zlib.brotliCompressSync(raw, {
+            params: {
+              [zlib.constants.BROTLI_PARAM_QUALITY]: 11,
+              [zlib.constants.BROTLI_PARAM_SIZE_HINT]: raw.byteLength,
+            },
+          });
+          if (br.byteLength < raw.byteLength) fs.writeFileSync(`${file}.br`, br);
+          // gzip as well: brotli needs HTTPS in some older mobile browsers,
+          // and the tunnel is not always TLS.
+          const gz = zlib.gzipSync(raw, { level: 9 });
+          if (gz.byteLength < raw.byteLength) fs.writeFileSync(`${file}.gz`, gz);
+        }
+      },
+    },
+  };
+}
+
 const API_TARGET = process.env.MINIAPP_DEV_API || 'http://127.0.0.1:8790';
 
 export default defineConfig({
-  plugins: [react(), swBuildId()],
+  plugins: [react(), swBuildId(), precompressAssets()],
   test: {
     // Component tests drive real DOM events through React; the pure-logic
     // suites do not care either way.
