@@ -92,13 +92,15 @@ describe('the follow-up reminder', () => {
       expect(line).toContain('[[QUESTION]]');
     }
     expect(STRICT_FOLLOWUP_REMINDER).toContain('irreversible');
+    expect(MOBILE_SESSION_PREAMBLE).toContain('labelled Markdown bullets');
+    expect(MOBILE_FOLLOWUP_REMINDER).toContain('phone-scannable');
   });
 
   it('is one line of prompt, not a second preamble', () => {
     // The whole reason it is a line and not the block: it is paid for on
     // every single message.
-    expect(MOBILE_FOLLOWUP_REMINDER.length).toBeLessThan(200);
-    expect(STRICT_FOLLOWUP_REMINDER.length).toBeLessThan(260);
+    expect(MOBILE_FOLLOWUP_REMINDER.length).toBeLessThan(260);
+    expect(STRICT_FOLLOWUP_REMINDER.length).toBeLessThan(320);
   });
 
   it('round-trips out of the user bubble', () => {

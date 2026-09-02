@@ -79,6 +79,10 @@ const PREAMBLE_HEAD = [
 ].join('\n');
 
 const PREAMBLE_TAIL = [
+  'Format final replies for a phone: use short paragraphs, concise headings,',
+  'and labelled Markdown bullets (`- **Label:** detail`) when parallel points',
+  'benefit from them. Do not force a template on simple answers.',
+  '',
   'The block must contain only JSON. The user taps an option and their',
   'choice arrives as your next message. End the turn after emitting it --',
   'do not keep working while you wait.]',
@@ -131,14 +135,16 @@ export function withPreamble(text: string, options: PreambleOptions = {}): strin
 export const MOBILE_FOLLOWUP_REMINDER =
   '[Reminder: mobile session -- never call ask_user_question or ' +
   'request_action_confirmation; ask with a [[QUESTION]] {json} ' +
-  '[[/QUESTION]] block and end the turn.]';
+  '[[/QUESTION]] block and end the turn. Keep final replies phone-scannable; ' +
+  'use labelled bullets for parallel points when useful.]';
 
 /** The same line, with the confirm-before-acting clause. */
 export const STRICT_FOLLOWUP_REMINDER =
   '[Reminder: mobile session -- never call ask_user_question or ' +
   'request_action_confirmation; ask with a [[QUESTION]] {json} ' +
   '[[/QUESTION]] block and end the turn. Confirm that way before any ' +
-  'external or irreversible action.]';
+  'external or irreversible action. Keep final replies phone-scannable; ' +
+  'use labelled bullets for parallel points when useful.]';
 
 export function reminderFor(options: PreambleOptions = {}): string {
   return options.strictConfirm

@@ -1491,21 +1491,22 @@
 }
 
 .md p {
-  margin: 0 0 14px;
+  margin: 0 0 15px;
 }
 
 .md h1,
 .md h2,
 .md h3,
 .md h4 {
-  margin: 24px 0 10px;
+  margin: 26px 0 10px;
   font-weight: var(--font-weight-semibold);
   letter-spacing: -0.018em;
   line-height: 1.28;
 }
 
+/* On a phone, hierarchy should come from rhythm before sheer type size. */
 .md h1 {
-  font-size: 1.375rem;
+  font-size: var(--text-xl);
 }
 .md h2 {
   font-size: var(--text-lg);
@@ -1519,16 +1520,67 @@
 
 .md ul,
 .md ol {
-  margin: 0 0 12px;
+  margin: 2px 0 16px;
   padding-left: 22px;
 }
 
 .md li {
-  margin: 4px 0;
+  margin: 7px 0;
 }
 
 .md li::marker {
   color: var(--surface-tertiary-foreground);
+}
+
+/*
+ * A list item that begins with a bold label is already a tiny information
+ * block. Give it the same scan pattern as the public preview: quiet icon,
+ * label on its own line, explanation beside it. MarkdownListItem applies
+ * this class only when the structure is explicit, so ordinary bullet lists
+ * keep their native markers and indentation.
+ */
+.md li.md-lead-item {
+  display: grid;
+  grid-template-columns: 38px minmax(0, 1fr);
+  align-items: start;
+  column-gap: 12px;
+  width: calc(100% + 22px);
+  margin: 17px 0 19px -22px;
+  list-style: none;
+}
+
+.md-lead-icon {
+  display: grid;
+  place-items: center;
+  width: 38px;
+  height: 38px;
+  border-radius: var(--radius-lg);
+  background: var(--muted);
+  color: var(--secondary-foreground);
+}
+
+.md-lead-copy {
+  min-width: 0;
+  padding-top: 1px;
+  color: var(--secondary-foreground);
+}
+
+.md-lead-copy > p {
+  margin-bottom: 0;
+}
+
+.md-lead-copy > strong:first-child,
+.md-lead-copy > p:first-child > strong:first-child {
+  display: block;
+  margin-bottom: 2px;
+  color: var(--foreground);
+  font-weight: var(--font-weight-semibold);
+  letter-spacing: -0.01em;
+  line-height: 1.35;
+}
+
+.md-lead-copy > :last-child {
+  margin-bottom: 0;
 }
 
 /* Inline code as a soft grey chip, as in the sidepanel. */
@@ -1711,7 +1763,7 @@
 .md hr {
   border: none;
   border-top: var(--hairline) solid var(--border);
-  margin: 18px 0;
+  margin: 24px 0;
 }
 
 .md table {

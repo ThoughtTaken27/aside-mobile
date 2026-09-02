@@ -1,8 +1,26 @@
-import { memo, useEffect, useMemo, useState } from 'react';
+import {
+  Children,
+  isValidElement,
+  memo,
+  useEffect,
+  useMemo,
+  useState,
+  type ComponentPropsWithoutRef,
+  type ReactNode,
+} from 'react';
 import ReactMarkdown, { defaultUrlTransform } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { api } from '../api';
 import { CodeBlock } from './CodeBlock';
+import {
+  CalendarDays,
+  Compass,
+  FileText,
+  Lightbulb,
+  ListTodo,
+  Target,
+  TriangleAlert,
+} from './Icons';
 import { openImage } from './ImageLightbox';
 import { normalizeLang, warmHighlighter } from '../utils/highlighter';
 import {
@@ -14,6 +32,80 @@ import {
 import { localImagePath } from '../utils/images';
 import { closeOpenFence, fenceLanguages } from '../utils/markdown';
 import type { CitationSource } from '../types';
+
+/** Return plain text from the small React subtree inside a Markdown label. */
+function reactText(node: ReactNode): string {
+  if (typeof node === 'string' || typeof node === 'number') return String(node);
+  if (!isValidElement(node)) return '';
+  return Children.toArray(
+    (node.props as { children?: ReactNode }).children,
+  )
+    .map(reactText)
+    .join('');
+}
+
+/**
+ * A labelled bullet is the compact content pattern models already use:
+ * `- **Goals:** finish the brief`. The generated README preview made clear
+ * that the phone should PRESENT that structure instead of drawing it as an
+ * ordinary bullet with one bold phrase buried in the line.
+ *
+ * Only a leading `<strong>` qualifies. Normal prose lists remain normal
+ * lists, so this changes hierarchy without guessing at the author's meaning.
+ */
+export function markdownLeadLabel(children: ReactNode): string {
+  const first = Children.toArray(children).find(
+    (child) => typeof child !== 'string' || child.trim(),
+  );
+  if (!isValidElement(first)) return '';
+  if (first.type === 'strong') return reactText(first).trim();
+  if (first.type !== 'p') return '';
+  const nested = Children.toArray(
+    (first.props as { children?: ReactNode }).children,
+  ).find((child) => typeof child !== 'string' || child.trim());
+  return isValidElement(nested) && nested.type === 'strong'
+    ? reactText(nested).trim()
+    : '';
+}
+
+function leadGlyph(label: string) {
+  const value = label.toLowerCase();
+  if (/goal|priority|target|objective/.test(value)) return Target;
+  if (/note|idea|tip|insight/.test(value)) return Lightbulb;
+  if (/schedule|time|tomorrow|date|calendar/.test(value)) return CalendarDays;
+  if (/warning|risk|issue|blocker|caution/.test(value)) return TriangleAlert;
+  if (/next|action|task|step|plan|checklist/.test(value)) return ListTodo;
+  if (/recommend|direction|decision|choice/.test(value)) return Compass;
+  return FileText;
+}
+
+function MarkdownListItem({
+  node: _node,
+  children,
+  className,
+  ...props
+}: ComponentPropsWithoutRef<'li'> & { node?: unknown }) {
+  const label = markdownLeadLabel(children);
+  if (!label) {
+    return (
+      <li {...props} className={className}>
+        {children}
+      </li>
+    );
+  }
+  const Glyph = leadGlyph(label);
+  return (
+    <li
+      {...props}
+      className={[className, 'md-lead-item'].filter(Boolean).join(' ')}
+    >
+      <span className="md-lead-icon" aria-hidden="true">
+        <Glyph size={18} strokeWidth={1.7} />
+      </span>
+      <div className="md-lead-copy">{children}</div>
+    </li>
+  );
+}
 
 /**
  * An image inside rendered markdown.
@@ -177,6 +269,7 @@ export const Markdown = memo(function Markdown({
           // remounts every image, losing the "this one failed" state and
           // re-requesting the file each time the streaming answer ticks.
           img: imageRenderer,
+          li: MarkdownListItem,
           // `CodeBlock` renders its OWN `<pre>` (plain, or Shiki's), so the
           // default `pre` wrapper is passed through unwrapped here rather
           // than nesting a second `<pre>` around it. Inline code (no fence,

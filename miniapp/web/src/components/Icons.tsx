@@ -46,6 +46,10 @@ import {
   RotateCw,
   ExternalLink,
   ArrowLeft,
+  CalendarDays,
+  Compass,
+  Lightbulb,
+  Target,
 } from 'lucide-react';
 import type { StepIcon } from '../types';
 
@@ -85,6 +89,12 @@ export {
   RotateCw,
   ExternalLink,
   ArrowLeft,
+  CalendarDays,
+  Compass,
+  FileText,
+  Lightbulb,
+  ListTodo,
+  Target,
 };
 
 /**
