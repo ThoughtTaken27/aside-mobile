@@ -103,11 +103,14 @@ const get = (url: string) =>
 describe('context window', () => {
   const catalog = buildCatalog(['claude-code']);
 
-  it('gives Fable 5 a million tokens and the rest the default', () => {
-    expect(contextWindowFor(catalog, 'claude-code', 'claude-fable-5')).toBe(
+  it('uses the Mac catalog windows for current Claude models', () => {
+    expect(contextWindowFor(catalog, 'claude-code', 'claude-fable-5-1')).toBe(
       1_000_000,
     );
     expect(contextWindowFor(catalog, 'claude-code', 'claude-sonnet-5')).toBe(
+      1_000_000,
+    );
+    expect(contextWindowFor(catalog, 'claude-code', 'claude-haiku-4-5')).toBe(
       DEFAULT_CONTEXT_WINDOW,
     );
   });
@@ -123,7 +126,7 @@ describe('context window', () => {
       'claude-code': {
         models: [
           { id: 'claude-sonnet-5', contextWindow: 500_000 },
-          { id: 'claude-fable-5', label: 'Fable Five' },
+          { id: 'claude-fable-5-1', label: 'Fable Five' },
         ],
       },
     });
@@ -131,7 +134,7 @@ describe('context window', () => {
       500_000,
     );
     // The rename must not silently reset Fable's window to the default.
-    expect(contextWindowFor(overridden, 'claude-code', 'claude-fable-5')).toBe(
+    expect(contextWindowFor(overridden, 'claude-code', 'claude-fable-5-1')).toBe(
       1_000_000,
     );
   });

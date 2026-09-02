@@ -20,6 +20,7 @@ import {
 import {
   readDesktopProviders,
   readDesktopSettings,
+  readResolvedProviders,
   desktopRoot,
 } from '../src/desktop.js';
 import { buildCatalog } from '../src/catalog.js';
@@ -214,6 +215,43 @@ describe('desktop catalog mirror', () => {
   it('never surfaces the provider api key', () => {
     const file = tempFile('models.json', MODELS);
     expect(JSON.stringify(readDesktopProviders(file))).not.toContain('sk-secret-value');
+  });
+
+  it('reads only visible official models in the Mac picker order', () => {
+    const file = tempFile(
+      'models-catalog.json',
+      JSON.stringify({
+        anthropic: {
+          visibleModelIds: ['claude-opus-5'],
+          models: [
+            { id: 'claude-hidden', name: 'Hidden', contextWindow: 200000 },
+            { id: 'claude-opus-5', name: 'Claude Opus 5', contextWindow: 1000000, input: ['text', 'image'] },
+          ],
+        },
+        'openai-codex': {
+          visibleModelIds: ['gpt-5.6-sol', 'gpt-5.3-codex-spark'],
+          models: [
+            { id: 'gpt-5.3-codex-spark', name: 'GPT-5.3 Codex Spark', contextWindow: 128000 },
+            { id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol', contextWindow: 272000 },
+          ],
+        },
+      }),
+    );
+    const providers = readResolvedProviders(file);
+    expect(providers.map((provider) => provider.id)).toEqual([
+      'claude-code',
+      'openai-codex',
+    ]);
+    expect(providers[0].models.map((model) => model.id)).toEqual(['claude-opus-5']);
+    expect(providers[0].models[0].contextWindow).toBe(1_000_000);
+    expect(providers[1].models.map((model) => model.id)).toEqual([
+      'gpt-5.6-sol',
+      'gpt-5.3-codex-spark',
+    ]);
+    expect(providers[1].models.map((model) => model.contextWindow)).toEqual([
+      272_000,
+      128_000,
+    ]);
   });
 
   it('drops a provider with no models rather than showing an empty row', () => {

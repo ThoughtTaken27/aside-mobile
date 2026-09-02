@@ -149,14 +149,16 @@
 }
 
 .composer .composer-actions {
-  gap: 5px;
+  gap: 6px;
 }
 
-/* Soft filled capsules, matching the round buttons beside them. */
+/* The capsule shares the round controls' exact 34px height, so every item
+   in the toolbar has one optical centre instead of the model sitting 1px
+   low inside a shorter shape. */
 .composer .pill {
-  height: 32px;
-  padding: 0 6px;
-  gap: 3px;
+  height: 34px;
+  padding: 0 8px;
+  gap: 4px;
   background: var(--muted);
 }
 
@@ -1795,6 +1797,15 @@
   font-size: var(--text-xs);
   color: var(--secondary-foreground);
   max-width: 100%;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+/* Ellipsis belongs on a shrinkable text box. Applying it to an inline-flex
+   parent with a sibling icon hard-clipped long page names instead. */
+.bubble-file-name {
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;

@@ -43,7 +43,7 @@ function BubbleAttachments({ files }: { files: Attachment[] }) {
       {files.map((file, index) => (
         <span className="bubble-file" key={`${file.name}-${index}`}>
           <FileIcon size={12} strokeWidth={1.75} />
-          {file.name}
+          <span className="bubble-file-name">{file.name}</span>
         </span>
       ))}
     </span>

@@ -90,6 +90,11 @@ export function desktopSettingsPath(root: string): string {
   return path.join(root, 'settings.json');
 }
 
+/** Account-resolved official-provider catalog written by the Mac app. */
+export function desktopCatalogPath(root: string): string {
+  return path.join(root, 'cache', 'models-catalog.json');
+}
+
 function readJson(file: string): unknown {
   try {
     return JSON.parse(fs.readFileSync(file, 'utf8'));
@@ -100,7 +105,7 @@ function readJson(file: string): unknown {
   }
 }
 
-/** What `models.json` records for one model, coerced and defaulted. */
+/** What either desktop catalog records for one model, coerced and defaulted. */
 function toModel(raw: unknown): DesktopModel | null {
   if (!raw || typeof raw !== 'object') return null;
   const record = raw as Record<string, unknown>;
@@ -146,6 +151,46 @@ export function readDesktopProviders(file: string): DesktopProvider[] {
       models,
     });
   }
+  return out;
+}
+
+/**
+ * Official providers exactly as the Mac picker resolved them for this
+ * account. `visibleModelIds` is authoritative: the cache also contains
+ * hidden/versioned models that the desktop deliberately leaves out.
+ */
+export function readResolvedProviders(file: string): DesktopProvider[] {
+  const parsed = readJson(file);
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return [];
+
+  const providerIdentity: Record<string, { id: string; label: string }> = {
+    anthropic: { id: 'claude-code', label: 'Claude' },
+    'openai-codex': { id: 'openai-codex', label: 'ChatGPT' },
+  };
+  const out: DesktopProvider[] = [];
+
+  for (const [cacheId, value] of Object.entries(parsed as Record<string, unknown>)) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) continue;
+    const record = value as Record<string, unknown>;
+    const visible = Array.isArray(record.visibleModelIds)
+      ? record.visibleModelIds.map(String)
+      : [];
+    const rawModels = Array.isArray(record.models) ? record.models : [];
+    const all = new Map(
+      rawModels
+        .map(toModel)
+        .filter((model): model is DesktopModel => model !== null)
+        .map((model) => [model.id, model]),
+    );
+    const models = visible
+      .map((id) => all.get(id))
+      .filter((model): model is DesktopModel => model !== undefined);
+    if (!models.length) continue;
+
+    const identity = providerIdentity[cacheId] ?? { id: cacheId, label: cacheId };
+    out.push({ ...identity, models });
+  }
+
   return out;
 }
 
@@ -196,8 +241,18 @@ export function readDesktopState(sessionsDir: string): DesktopState {
   const { defaultModel, categories } = readDesktopSettings(
     desktopSettingsPath(root),
   );
+  const providers = new Map<string, DesktopProvider>();
+  // The resolved cache supplies official/account-filtered providers. Custom
+  // routers from models.json then replace a same-id row, matching the Mac's
+  // own explicit configuration precedence.
+  for (const provider of readResolvedProviders(desktopCatalogPath(root))) {
+    providers.set(provider.id, provider);
+  }
+  for (const provider of readDesktopProviders(modelsPath(root))) {
+    providers.set(provider.id, provider);
+  }
   return {
-    providers: readDesktopProviders(modelsPath(root)),
+    providers: [...providers.values()],
     defaultModel,
     categories,
   };

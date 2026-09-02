@@ -43,8 +43,8 @@ describe('credential seeding', () => {
 
 describe('buildCatalog', () => {
   it('marks credentialed providers connected and sorts them first', () => {
-    const catalog = buildCatalog(['xai-grok-oauth']);
-    expect(catalog[0].id).toBe('xai-grok-oauth');
+    const catalog = buildCatalog(['openai-codex']);
+    expect(catalog[0].id).toBe('openai-codex');
     expect(catalog[0].connected).toBe(true);
     expect(catalog.find((p) => p.id === 'claude-code')?.connected).toBe(false);
   });
@@ -55,25 +55,26 @@ describe('buildCatalog', () => {
     const chatgpt = catalog.find((p) => p.id === 'openai-codex')!;
 
     expect(claude.label).toBe('Claude');
-    expect(claude.models.map((m) => m.label)).toContain('Fable 5');
-    expect(claude.models.find((m) => m.label === 'Fable 5')?.id).toBe(
-      'claude-fable-5',
+    expect(claude.models.map((m) => m.label)).toContain('Fable 5.1');
+    expect(claude.models.find((m) => m.label === 'Fable 5.1')?.id).toBe(
+      'claude-fable-5-1',
     );
 
     expect(chatgpt.label).toBe('ChatGPT');
     expect(chatgpt.models.map((m) => m.id)).toEqual([
+      'gpt-5.6-sol',
       'gpt-5.6-terra',
       'gpt-5.6-luna',
       'gpt-5.5',
-      'gpt-5.4',
-      'gpt-5.4-mini',
       'gpt-5.3-codex-spark',
     ]);
+    expect(chatgpt.models.find((m) => m.id === 'gpt-5.6-sol')?.contextWindow).toBe(272_000);
+    expect(chatgpt.models.find((m) => m.id === 'gpt-5.3-codex-spark')?.contextWindow).toBe(128_000);
   });
 
   it('shows every built-in provider when credentials cannot be read', () => {
     const catalog = buildCatalog([]);
-    expect(catalog.length).toBeGreaterThanOrEqual(3);
+    expect(catalog.length).toBeGreaterThanOrEqual(2);
     expect(catalog.every((p) => p.connected)).toBe(true);
   });
 
@@ -90,7 +91,7 @@ describe('buildCatalog', () => {
     });
     const claude = catalog.find((p) => p.id === 'claude-code')!;
     // Merge keeps the built-ins and adds the new one.
-    expect(claude.models.map((m) => m.id)).toContain('claude-fable-5');
+    expect(claude.models.map((m) => m.id)).toContain('claude-fable-5-1');
     expect(claude.models.map((m) => m.id)).toContain('claude-fable-6');
   });
 
@@ -119,13 +120,24 @@ describe('buildCatalog', () => {
     });
     expect(catalog.find((p) => p.id === 'my-local')?.label).toBe('Local');
   });
+
+  it('keeps an explicitly hidden provider out even when desktop-bound', () => {
+    const catalog = buildCatalog(
+      ['claude-code', 'openai-codex'],
+      { 'claude-code': { hidden: true } },
+      [],
+      [{ provider: 'claude-code', modelId: 'claude-opus-5', thinkingLevel: 'high' }],
+    );
+    expect(catalog.some((p) => p.id === 'claude-code')).toBe(false);
+    expect(catalog.some((p) => p.id === 'openai-codex')).toBe(true);
+  });
 });
 
 describe('modelLabel', () => {
   const catalog = buildCatalog(['claude-code']);
 
   it('resolves a display name for the pill', () => {
-    expect(modelLabel(catalog, 'claude-code', 'claude-fable-5')).toBe('Fable 5');
+    expect(modelLabel(catalog, 'claude-code', 'claude-fable-5-1')).toBe('Fable 5.1');
   });
 
   it('falls back to the raw id rather than hiding an unknown model', () => {

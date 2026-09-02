@@ -42,7 +42,7 @@ import { useDockHeight } from './hooks/useDockHeight';
 import { resolvePills } from './utils/pills';
 import { startVisiblePolling } from './utils/polling';
 import { resolveThreadModel } from './utils/sessionState';
-import { readLocal, writeLocal } from './utils/storage';
+import { readLocal, removeLocal, writeLocal } from './utils/storage';
 import {
   applyTheme,
   authenticateIfEnabled,
@@ -445,6 +445,32 @@ export default function App() {
     void loadSessions();
     api.status().then(setStatus, () => {});
   }, [auth.phase, loadSessions]);
+
+  // The desktop catalog can change while the installed app stays alive.
+  // Refresh it on a short visible-only loop, and immediately when the phone
+  // returns from the background, instead of freezing the boot-time copy.
+  useEffect(() => {
+    if (auth.phase !== 'ready') return undefined;
+    return startVisiblePolling(async () => {
+      setStatus(await api.status());
+    }, 8_000);
+  }, [auth.phase]);
+
+  // A removed provider must not survive as a local override. This matters
+  // most when a subscription ends: otherwise the catalog can correctly hide
+  // Claude while the composer keeps advertising its stale saved selection.
+  useEffect(() => {
+    if (!status || !provider || !modelId) return;
+    const valid = status.catalog.some(
+      (entry) =>
+        entry.id === provider && entry.models.some((model) => model.id === modelId),
+    );
+    if (valid) return;
+    setProvider('');
+    setModelId('');
+    removeLocal(PROVIDER_KEY);
+    removeLocal(MODEL_KEY);
+  }, [status, provider, modelId]);
 
   // --- navigation ---------------------------------------------------------
   const screen = stack[stack.length - 1] as ThreadScreenState | undefined;

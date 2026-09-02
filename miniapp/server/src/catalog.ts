@@ -24,9 +24,8 @@ export interface CatalogModel {
   /** What Aside's own picker shows, e.g. "GPT-5.5". */
   label: string;
   /**
-   * Context window in tokens -- the denominator of the ring next to the
-   * model pill. Aside's own tooltip reports 1000k for Fable 5 and the rest
-   * of the line at 200k, which is what the defaults below encode.
+   * Context window in tokens, mirrored from the Mac catalog and used as
+   * the denominator of the ring next to the model pill.
    */
   contextWindow: number;
 }
@@ -51,7 +50,7 @@ export interface CatalogProvider {
 interface ProviderSeed {
   id: string;
   label: string;
-  /** `contextWindow` is omitted wherever the 200k default is right. */
+  /** `contextWindow` is omitted wherever the 200k fallback is right. */
   models: Array<{ id: string; label: string; contextWindow?: number }>;
 }
 
@@ -60,10 +59,11 @@ const BUILTIN: ProviderSeed[] = [
     id: 'claude-code',
     label: 'Claude',
     models: [
-      { id: 'claude-fable-5', label: 'Fable 5', contextWindow: 1_000_000 },
-      { id: 'claude-opus-5', label: 'Opus 5' },
-      { id: 'claude-opus-4-8', label: 'Opus 4.8' },
-      { id: 'claude-sonnet-5', label: 'Sonnet 5' },
+      { id: 'claude-fable-5-1', label: 'Fable 5.1', contextWindow: 1_000_000 },
+      { id: 'claude-opus-5', label: 'Opus 5', contextWindow: 1_000_000 },
+      { id: 'claude-sonnet-5', label: 'Sonnet 5', contextWindow: 1_000_000 },
+      { id: 'claude-opus-4-6', label: 'Opus 4.6', contextWindow: 1_000_000 },
+      { id: 'claude-sonnet-4-6', label: 'Sonnet 4.6', contextWindow: 1_000_000 },
       { id: 'claude-haiku-4-5', label: 'Haiku 4.5' },
     ],
   },
@@ -71,23 +71,37 @@ const BUILTIN: ProviderSeed[] = [
     id: 'openai-codex',
     label: 'ChatGPT',
     models: [
-      { id: 'gpt-5.6-terra', label: 'GPT-5.6 Terra' },
-      { id: 'gpt-5.6-luna', label: 'GPT-5.6 Luna' },
-      { id: 'gpt-5.5', label: 'GPT-5.5' },
-      { id: 'gpt-5.4', label: 'GPT-5.4' },
-      { id: 'gpt-5.4-mini', label: 'GPT-5.4 mini' },
-      { id: 'gpt-5.3-codex-spark', label: 'GPT-5.3 Codex Spark' },
-    ],
-  },
-  {
-    id: 'xai-grok-oauth',
-    label: 'Grok',
-    models: [
-      { id: 'grok-4.5', label: 'Grok 4.5' },
-      { id: 'grok-4-fast', label: 'Grok 4 Fast' },
+      { id: 'gpt-5.6-sol', label: 'GPT-5.6 Sol', contextWindow: 272_000 },
+      { id: 'gpt-5.6-terra', label: 'GPT-5.6 Terra', contextWindow: 272_000 },
+      { id: 'gpt-5.6-luna', label: 'GPT-5.6 Luna', contextWindow: 272_000 },
+      { id: 'gpt-5.5', label: 'GPT-5.5', contextWindow: 272_000 },
+      { id: 'gpt-5.3-codex-spark', label: 'GPT-5.3 Codex Spark', contextWindow: 128_000 },
     ],
   },
 ];
+
+/* Context metadata for historical sessions whose model is no longer in the
+   current visible picker. The Mac cache still records Fable 5 at 1M even
+   though only Fable 5.1 is selectable now. */
+const KNOWN_CONTEXT_WINDOWS = new Map<string, number>([
+  ...BUILTIN.flatMap((provider) =>
+    provider.models.map((model) => [
+      `${provider.id}/${model.id}`,
+      model.contextWindow ?? DEFAULT_CONTEXT_WINDOW,
+    ] as const),
+  ),
+  ['claude-code/claude-fable-5', 1_000_000],
+]);
+
+const KNOWN_MODEL_LABELS = new Map<string, string>([
+  ...BUILTIN.flatMap((provider) =>
+    provider.models.map((model) => [
+      `${provider.id}/${model.id}`,
+      model.label,
+    ] as const),
+  ),
+  ['claude-code/claude-fable-5', 'Fable 5'],
+]);
 
 /** Shape of the optional `models` section in the bridge config. */
 export interface CatalogOverride {
@@ -97,6 +111,8 @@ export interface CatalogOverride {
   replace?: boolean;
   /** Force the provider to show even without local credentials. */
   connected?: boolean;
+  /** Explicitly remove this provider from the phone picker. */
+  hidden?: boolean;
 }
 
 /**
@@ -131,6 +147,7 @@ export function buildCatalog(
 ): CatalogProvider[] {
   const connectedSet = new Set(providerIds);
   const seedUnknown = providerIds.length === 0;
+  const hidden = new Set<string>();
 
   const byId = new Map<string, CatalogProvider>();
   for (const base of BUILTIN) {
@@ -173,6 +190,7 @@ export function buildCatalog(
   }
 
   for (const [id, override] of Object.entries(overrides || {})) {
+    if (override.hidden) hidden.add(id);
     const existing = byId.get(id);
     const target: CatalogProvider = existing ?? {
       id,
@@ -228,7 +246,9 @@ export function buildCatalog(
         {
           id: ref.modelId,
           label: ref.modelId,
-          contextWindow: DEFAULT_CONTEXT_WINDOW,
+          contextWindow:
+            KNOWN_CONTEXT_WINDOWS.get(`${ref.provider}/${ref.modelId}`) ??
+            DEFAULT_CONTEXT_WINDOW,
         },
       ];
     }
@@ -242,7 +262,7 @@ export function buildCatalog(
   // something the account can actually run.
   const order = new Map(BUILTIN.map((b, i) => [b.id, i]));
   return [...byId.values()]
-    .filter((p) => p.models.length > 0 || p.connected)
+    .filter((p) => !hidden.has(p.id) && (p.models.length > 0 || p.connected))
     .sort((a, b) => {
       if (a.connected !== b.connected) return a.connected ? -1 : 1;
       return (order.get(a.id) ?? 99) - (order.get(b.id) ?? 99);
@@ -259,9 +279,10 @@ export function modelLabel(
     if (p.id !== provider) continue;
     for (const m of p.models) if (m.id === modelId) return m.label;
   }
-  // Unknown ids still need to render as something -- show the raw id
-  // rather than a placeholder that hides which model is actually running.
-  return modelId;
+  // Historical models can disappear from the visible picker while old
+  // sessions still run them. Preserve their known label before falling back
+  // to the raw id for a model we have genuinely never seen.
+  return KNOWN_MODEL_LABELS.get(`${provider}/${modelId}`) ?? modelId;
 }
 
 /**
@@ -280,5 +301,7 @@ export function contextWindowFor(
     if (p.id !== provider) continue;
     for (const m of p.models) if (m.id === modelId) return m.contextWindow;
   }
-  return DEFAULT_CONTEXT_WINDOW;
+  return (
+    KNOWN_CONTEXT_WINDOWS.get(`${provider}/${modelId}`) ?? DEFAULT_CONTEXT_WINDOW
+  );
 }

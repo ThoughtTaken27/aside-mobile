@@ -28,12 +28,13 @@ import {
   archiveSession,
 } from './facade.js';
 import {
+  DEFAULT_CONTEXT_WINDOW,
   buildCatalog,
   contextWindowFor,
   modelLabel,
   readProviderIds,
 } from './catalog.js';
-import { readDesktopState } from './desktop.js';
+import { readDesktopState, type DesktopModelRef } from './desktop.js';
 import { TranscribeError, transcribeAudio } from './transcribe.js';
 import { WhisperServer } from './whisperserver.js';
 import { derivePairingKey } from './pair.js';
@@ -339,6 +340,7 @@ export async function buildServer(
   const CATALOG_TTL_MS = 5_000;
   let catalogCache: ReturnType<typeof buildCatalog> = [];
   let catalogAt = 0;
+  let catalogDefault: DesktopModelRef | null = null;
 
   function currentCatalog(): ReturnType<typeof buildCatalog> {
     const now = Date.now();
@@ -346,14 +348,40 @@ export async function buildServer(
       return catalogCache;
     }
     const desktop = readDesktopState(config.sessionsDir);
+    catalogDefault = desktop.defaultModel;
     catalogCache = buildCatalog(
       readProviderIds(config.credentialsPath),
       config.modelCatalogOverrides as any,
       desktop.providers,
-      [desktop.defaultModel, ...Object.values(desktop.categories)],
+      [
+        desktop.defaultModel,
+        // `aside` is an internal category binding, not a selectable provider
+        // in the Mac model picker. Surfacing it created a fake fifth row on
+        // the phone containing a duplicate GPT model.
+        ...Object.values(desktop.categories).filter(
+          (ref) => ref.provider !== 'aside',
+        ),
+      ],
     );
     catalogAt = now;
     return catalogCache;
+  }
+
+  /** Context denominator when a session has not written its own model yet. */
+  function defaultContextWindow(): number {
+    const liveCatalog = currentCatalog();
+    let ref = catalogDefault;
+    if (!ref && config.defaultModel.includes('/')) {
+      const split = config.defaultModel.indexOf('/');
+      ref = {
+        provider: config.defaultModel.slice(0, split),
+        modelId: config.defaultModel.slice(split + 1),
+        thinkingLevel: '',
+      };
+    }
+    return ref
+      ? contextWindowFor(liveCatalog, ref.provider, ref.modelId)
+      : DEFAULT_CONTEXT_WINDOW;
   }
 
   /**
@@ -1484,7 +1512,7 @@ export async function buildServer(
         parentId: state.parentId,
         contextWindow: state.model
           ? contextWindowFor(catalog, state.model.provider, state.model.modelId)
-          : contextWindowFor(catalog, 'claude-code', config.defaultModel),
+          : defaultContextWindow(),
         busy: running,
         /** Only a child process launched by this server can be cancelled here. */
         stoppable: runner.isBusy(id),
@@ -2387,12 +2415,21 @@ export async function buildServer(
       override.defaultProvider && override.defaultModelId,
     );
 
+    const configuredSplit = config.defaultModel.indexOf('/');
+    const configuredModelId = configuredSplit > 0
+      ? config.defaultModel.slice(configuredSplit + 1)
+      : config.defaultModel;
+    const configuredProvider = configuredSplit > 0
+      ? config.defaultModel.slice(0, configuredSplit)
+      : catalog.find((entry) =>
+          entry.models.some((model) => model.id === configuredModelId),
+        )?.id || '';
     const provider = hasOverride
       ? override.defaultProvider
-      : daemonDefault?.provider || fallback?.provider || 'claude-code';
+      : daemonDefault?.provider || fallback?.provider || configuredProvider;
     const modelId = hasOverride
       ? override.defaultModelId
-      : daemonDefault?.modelId || fallback?.modelId || config.defaultModel;
+      : daemonDefault?.modelId || fallback?.modelId || configuredModelId;
     const effort =
       (hasOverride && override.defaultEffort) ||
       daemonDefault?.thinkingLevel ||
@@ -2982,7 +3019,7 @@ export async function buildServer(
         model,
         contextWindow: state.model
           ? contextWindowFor(catalog, state.model.provider, state.model.modelId)
-          : contextWindowFor(catalog, 'claude-code', config.defaultModel),
+          : defaultContextWindow(),
         suspended: isSuspended(status),
       };
     },
