@@ -76,6 +76,12 @@ function BubbleAttachments({ files }: { files: Attachment[] }) {
  *
  * Exported and tested directly; it is a state machine, not a detail.
  */
+export function threadRowClassName(items: ThreadItem[], index: number): string {
+  const kind = items[index]?.kind ?? 'unknown';
+  const previous = items[index - 1]?.kind ?? 'start';
+  return `thread-row is-${kind} after-${previous}`;
+}
+
 export function foldIsLive(items: ThreadItem[], index: number): boolean {
   const block = items[index];
   if (block.kind !== 'work' || !block.running) return false;
@@ -254,6 +260,7 @@ export function Thread(props: ThreadProps) {
               key={virtualRow.key}
               ref={virtualizer.measureElement}
               data-index={virtualRow.index}
+              className={threadRowClassName(items, virtualRow.index)}
               style={{
                 position: 'absolute',
                 top: 0,

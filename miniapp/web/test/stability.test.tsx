@@ -14,7 +14,7 @@ import { QuestionCard } from '../src/components/QuestionCard';
 import { TodoSection, todoSummary } from '../src/components/TodoSection';
 import { StreamFooter } from '../src/components/StreamFooter';
 import { Composer } from '../src/components/Composer';
-import { foldIsLive } from '../src/components/Thread';
+import { foldIsLive, threadRowClassName } from '../src/components/Thread';
 import { ProviderMark, hasProviderMark } from '../src/components/Brand';
 import type {
   ComposerAttachment,
@@ -98,6 +98,33 @@ describe('when a work fold shows its timeline', () => {
   it('is never live for anything that is not a fold', () => {
     expect(foldIsLive([answer], 0)).toBe(false);
     expect(foldIsLive([streaming], 0)).toBe(false);
+  });
+});
+
+describe('thread row rhythm', () => {
+  const user: ThreadItem = {
+    kind: 'user',
+    id: 'user-1',
+    text: 'Question',
+    ts: 1,
+  };
+
+  it('marks a direct reply as belonging to the user turn', () => {
+    expect(threadRowClassName([user, answer], 1)).toBe(
+      'thread-row is-answer after-user',
+    );
+  });
+
+  it('marks work and its answer as two distinct spacing relationships', () => {
+    const items = [user, fold(false), answer];
+    expect(threadRowClassName(items, 1)).toBe('thread-row is-work after-user');
+    expect(threadRowClassName(items, 2)).toBe('thread-row is-answer after-work');
+  });
+
+  it('marks a later user message as a new exchange', () => {
+    expect(threadRowClassName([answer, user], 1)).toBe(
+      'thread-row is-user after-answer',
+    );
   });
 });
 

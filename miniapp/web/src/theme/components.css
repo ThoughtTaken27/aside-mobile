@@ -177,13 +177,28 @@
 }
 
 /*
- * No geometry override for the reply variant.
+ * The thread composer follows the Mac app's quieter, tighter dock.
  *
- * It used to be squatter and less rounded than the home composer, which is
- * the single biggest reason the thread read as a different screen rather
- * than the same one with history in it. The only thing that varies between
- * the two now is the placeholder text.
+ * It keeps the same controls and two-row phone layout as home, but removes
+ * enough padding and shadow to stop the composer from owning the bottom
+ * quarter of a small screen. The Mac composer is a slim floating capsule;
+ * this is the phone-sized version of that geometry, not a separate widget.
  */
+.composer-reply {
+  padding: 12px 10px 10px;
+  gap: 8px;
+  border-radius: var(--radius-2xl);
+  box-shadow:
+    0 1px 2px oklch(14.5% 0 0 / 0.045),
+    0 10px 28px -14px oklch(14.5% 0 0 / 0.16);
+}
+
+.composer-reply .composer-input {
+  padding-inline: 6px;
+  font-size: var(--text-base);
+  line-height: 1.4;
+  letter-spacing: -0.006em;
+}
 
 .composer-input {
   width: 100%;
@@ -646,11 +661,11 @@
 .thread-header {
   display: flex;
   align-items: center;
-  gap: 4px;
-  padding: 6px 8px;
+  gap: 6px;
+  padding: 7px 12px;
   /* Fullscreen mode lands the header under the status bar / Telegram's own
      floating chrome without this -- see telegram.ts `bindSafeAreaVars`. */
-  padding-top: calc(6px + var(--tg-chrome-top, var(--shell-content-top, 0px)));
+  padding-top: calc(7px + var(--tg-chrome-top, var(--shell-content-top, 0px)));
   border-bottom: var(--hairline) solid var(--border);
   background: var(--background);
   flex: none;
@@ -659,9 +674,10 @@
 .thread-title {
   flex: 1;
   min-width: 0;
-  font-size: var(--text-sm);
+  font-size: 0.9375rem;
   font-weight: var(--font-weight-medium);
-  color: var(--secondary-foreground);
+  letter-spacing: -0.008em;
+  color: var(--foreground);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -710,25 +726,48 @@
 }
 
 /*
- * Turn rhythm.
+ * Turn rhythm, on the measured virtual rows.
  *
- * The old flat `gap: 18px` spaced a user bubble from its answer exactly as
- * far as it spaced one exchange from the next, so the thread read as a
- * uniform stack of unrelated blocks -- the "disorganized" complaint. A
- * question and its answer belong together; the next question is a new
- * thing. So the gaps differ by a factor of two and the eye gets the
- * grouping for free.
+ * React Virtual measures `.thread-row`, not the message nested inside it.
+ * The old margins lived on `.turn-user` / `.turn-answer`; the virtualizer
+ * therefore measured straight through them and left only 14px between a
+ * question and its reply. Padding belongs to the measured row, so every
+ * gap below is real, stable, and survives rows being recycled.
  *
- * Applied as margins on the virtualized rows rather than as a flex gap,
- * because the virtualizer absolutely-positions each row and a gap on the
- * container never reaches them.
+ * The Mac app uses two rhythms: generous air after the user's bubble, then
+ * a tighter link from the work summary into the final answer. A new user
+ * turn gets the largest break so exchanges stay visually grouped.
  */
-.thread > div > .turn-user {
-  margin-top: 26px;
+.thread-row {
+  box-sizing: border-box;
 }
 
-.thread > div:first-child > .turn-user {
-  margin-top: 0;
+.thread-row.is-user:not(.after-start) {
+  padding-top: 44px;
+}
+
+.thread-row.is-work.after-user {
+  padding-top: 42px;
+}
+
+.thread-row.is-answer.after-user,
+.thread-row.is-streaming.after-user {
+  padding-top: 38px;
+}
+
+.thread-row.is-answer.after-work,
+.thread-row.is-streaming.after-work,
+.thread-row.is-question.after-work,
+.thread-row.is-error.after-work {
+  padding-top: 16px;
+}
+
+.thread-row.is-answer:not(.after-user):not(.after-work),
+.thread-row.is-streaming:not(.after-user):not(.after-work),
+.thread-row.is-work:not(.after-user),
+.thread-row.is-question:not(.after-work),
+.thread-row.is-error:not(.after-work) {
+  padding-top: 14px;
 }
 
 /*
@@ -740,10 +779,6 @@
   display: flex;
   flex-direction: column;
   align-items: flex-end;
-}
-
-.turn-answer {
-  margin-top: 14px;
 }
 
 /*
@@ -1442,7 +1477,8 @@
 
 .md {
   font-size: var(--text-base);
-  line-height: var(--leading-relaxed);
+  line-height: 1.56;
+  letter-spacing: -0.004em;
   word-break: break-word;
 }
 
@@ -1455,27 +1491,27 @@
 }
 
 .md p {
-  margin: 0 0 12px;
+  margin: 0 0 14px;
 }
 
 .md h1,
 .md h2,
 .md h3,
 .md h4 {
-  margin: 22px 0 10px;
-  font-weight: var(--font-weight-bold);
-  letter-spacing: -0.021em;
-  line-height: 1.25;
+  margin: 24px 0 10px;
+  font-weight: var(--font-weight-semibold);
+  letter-spacing: -0.018em;
+  line-height: 1.28;
 }
 
 .md h1 {
-  font-size: var(--text-2xl);
+  font-size: 1.375rem;
 }
 .md h2 {
-  font-size: var(--text-xl);
+  font-size: var(--text-lg);
 }
 .md h3 {
-  font-size: var(--text-lg);
+  font-size: 1.0625rem;
 }
 .md h4 {
   font-size: var(--text-base);
