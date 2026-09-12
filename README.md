@@ -9,6 +9,7 @@ Android can run as a native Capacitor app with an embedded GeckoView browser; iP
 <p align="center">
   <img src="docs/screenshots/home.png" width="280" alt="Aside Mobile home screen">
   <img src="docs/screenshots/recents.png" width="280" alt="Aside Mobile recent sessions">
+  <img src="docs/screenshots/chat.png" width="280" alt="Aside Mobile chat thread">
 </p>
 
 ## Security model
