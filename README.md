@@ -7,8 +7,8 @@ Aside Mobile provides chat, live browser viewing, local browser-history search, 
 Android can run as a native Capacitor app with an embedded GeckoView browser; iPhone and Android can also install the same interface as a home-screen web app.
 
 <p align="center">
-  <img src="docs/screenshots/home.png" width="250" alt="Aside Mobile home screen">
-  <img src="docs/screenshots/recents.png" width="250" alt="Aside Mobile recent sessions">
+  <img src="docs/screenshots/home.png" width="280" alt="Aside Mobile home screen">
+  <img src="docs/screenshots/recents.png" width="280" alt="Aside Mobile recent sessions">
 </p>
 
 ## Security model
